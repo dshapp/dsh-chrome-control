@@ -27,10 +27,6 @@ jobs:
             platform: darwin
             arch: arm64
             target: aarch64-apple-darwin
-          - os: macos-13
-            platform: darwin
-            arch: x64
-            target: x86_64-apple-darwin
           - os: ubuntu-latest
             platform: linux
             arch: x64
@@ -108,7 +104,6 @@ jobs:
           set -euo pipefail
           find binaries -type f | sort
           test -f binaries/darwin-arm64/chrome-daemon
-          test -f binaries/darwin-x64/chrome-daemon
           test -f binaries/linux-x64/chrome-daemon
           test -f binaries/win32-x64/chrome-daemon.exe
 

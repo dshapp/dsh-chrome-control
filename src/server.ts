@@ -21,6 +21,7 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { chmodSync, existsSync } from 'node:fs'
 import * as http from 'node:http'
 import * as path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
 import * as McpClient from '@deepseek-ai/dsh-mcp-client'
 // Type-only: contributes the `webServer` service augmentation to Context.
@@ -67,7 +68,11 @@ const PLATFORM_ARCH = `${process.platform}-${process.arch}`
  * a dev build beside the plugin, then the legacy install dir.
  */
 function resolveBinary(): string | undefined {
-  const here = path.dirname(new URL('.', import.meta.url).pathname)
+  // `fileURLToPath(new URL('.', import.meta.url))` yields the directory of
+  // this module with a trailing slash handled correctly. `path.dirname` on
+  // the raw pathname would strip the trailing "lib/" and return the package
+  // root one level too high.
+  const here = fileURLToPath(new URL('.', import.meta.url))
   const candidates = [
     // shipped: the CI matrix drops each platform's binary under binaries/<platform>-<arch>/
     path.resolve(here, '..', 'binaries', PLATFORM_ARCH, EXE),

@@ -33,8 +33,29 @@ jobs:
           node-version: 22
           cache: pnpm
 
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            daemon/target
+          key: cargo-pr-${{ hashFiles('daemon/Cargo.lock') }}
+          restore-keys: cargo-pr-
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Rust tests
+        working-directory: daemon
+        run: cargo test --locked
+
+      - name: Rust release build (smoke)
+        working-directory: daemon
+        run: cargo build --release --locked
 
       - name: Typecheck
         run: pnpm run typecheck

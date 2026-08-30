@@ -1,0 +1,28 @@
+[package]
+name = "chrome-daemon"
+version = "0.3.0"
+edition = "2021"
+description = "DeepSeek Harness Chrome bridge: standalone Rust daemon exposing the user's real Chrome to the agent as mcp__chrome__* tools."
+license = "MIT"
+
+[[bin]]
+name = "chrome-daemon"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+http = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

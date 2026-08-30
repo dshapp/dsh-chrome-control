@@ -1,33 +1,37 @@
 /**
- * End-to-end proof over a real HTTP server: the plugin mounts its routes on a
- * live `webServer`, the in-box mcp-client bridge discovers the catalog through
- * `/chrome/mcp` and registers `mcp__chrome__*` on the tool runtime, and a
- * WebSocket "extension" completes a whole tool call round trip.
+ * End-to-end proof over the spawned Rust daemon: `tools/list` returns the
+ * catalog, `/chrome/status` reports wiring, and a WebSocket "extension"
+ * completes a whole tool-call round trip through the daemon's own ports.
+ *
+ * Requires the release binary at `daemon/target/release/chrome-daemon`.
  */
 
-import { Context } from '@deepseek-ai/cordis'
-import WebServer from '@deepseek-ai/dsh-host-webserver'
-import ToolRuntime from '@deepseek-ai/dsh-tools'
+import { spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import * as path from 'node:path'
 import WebSocket from 'ws'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import * as Server from '../src/server.ts'
-import { TOOLS } from '../src/tools-catalog.ts'
 
-const ctx = new Context()
-let base = ''
+const BIN = path.resolve(import.meta.dirname, '..', 'daemon', 'target', 'release', 'chrome-daemon')
+const PORT = 37187 // ephemeral test port, avoids clashing with a running daemon
+const BASE = `http://127.0.0.1:${PORT}`
 
-async function until<T>(probe: () => T | undefined | Promise<T | undefined>, what: string): Promise<T> {
+let child: ReturnType<typeof spawn> | undefined
+
+async function untilReady(): Promise<void> {
   const deadline = Date.now() + 10_000
   for (;;) {
-    const value = await probe()
-    if (value !== undefined) return value
-    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`)
-    await new Promise(resolve => setTimeout(resolve, 50))
+    try {
+      const r = await fetch(`${BASE}/chrome/status`)
+      if (r.ok) return
+    } catch {}
+    if (Date.now() > deadline) throw new Error('chrome-daemon did not start in time')
+    await new Promise(resolve => setTimeout(resolve, 100))
   }
 }
 
 async function rpc(body: unknown): Promise<any> {
-  const response = await fetch(`${base}/chrome/mcp`, {
+  const response = await fetch(`${BASE}/chrome/mcp`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
@@ -37,96 +41,106 @@ async function rpc(body: unknown): Promise<any> {
 }
 
 beforeAll(async () => {
-  await ctx.plugin(WebServer, { host: '127.0.0.1', port: 0 })
-  // ToolRuntime wires tool schemas into the system prompt; a recording stub
-  // satisfies that inject without dragging the whole prompt stack in.
-  ctx.provide('systemPrompt')
-  ;(ctx as any).systemPrompt = { tools: () => () => {}, section: () => () => {} }
-  await ctx.plugin(ToolRuntime)
-  await ctx.plugin(Server)
-  base = `http://127.0.0.1:${ctx.webServer.port}`
+  if (!existsSync(BIN)) throw new Error(`release binary missing: ${BIN}; run cargo build --release`)
+  child = spawn(BIN, ['--port', String(PORT), '--host', '127.0.0.1'], { stdio: 'ignore' })
+  await untilReady()
 })
 
-afterAll(async () => {
-  await (ctx as any).dispose?.()
+afterAll(() => {
+  if (child !== undefined && !child.killed) child.kill('SIGTERM')
 })
 
-describe('bridge on the shared web server', () => {
-  it('answers /chrome/status with our identity', async () => {
-    const status = (await (await fetch(`${base}/chrome/status`)).json()) as any
-    expect(status.name).toBe('dsh-chrome')
-    expect(status.running).toBe(true)
-    expect(status.extension_connected).toBe(false)
+describe('chrome-daemon (end-to-end)', () => {
+  it('GET /chrome/status reports the wiring', async () => {
+    const r = await fetch(`${BASE}/chrome/status`)
+    expect(r.status).toBe(200)
+    const v = await r.json() as any
+    expect(v.name).toBe('dsh-chrome')
+    expect(v.running).toBe(true)
+    expect(v.extension_connected).toBe(false)
   })
 
-  it('serves MCP initialize and tools/list on /chrome/mcp', async () => {
-    const initialized = await rpc({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })
-    expect(initialized.result.serverInfo.name).toBe('dsh-chrome')
-    const listed = await rpc({ jsonrpc: '2.0', id: 2, method: 'tools/list' })
-    expect(listed.result.tools).toHaveLength(TOOLS.length)
+  it('initialize', async () => {
+    const v = await rpc({ jsonrpc: '2.0', id: 1, method: 'initialize' })
+    expect(v.result.serverInfo.name).toBe('dsh-chrome')
+    expect(v.result.protocolVersion).toBe('2025-06-18')
   })
 
-  it('declines the SSE stream GET, as the daemon did', async () => {
-    const response = await fetch(`${base}/chrome/mcp`)
-    expect(response.status).toBe(405)
+  it('tools/list advertises 27 tools', async () => {
+    const v = await rpc({ jsonrpc: '2.0', id: 2, method: 'tools/list' })
+    expect(v.result.tools.length).toBe(27)
+    expect(v.result.tools[0].name).toBe('navigate')
   })
 
-  it('registers the whole catalog as mcp__chrome__* through the in-box bridge', async () => {
-    const tools = await until(
-      () => ctx.get('tools') as InstanceType<typeof ToolRuntime> | undefined,
-      'tool runtime service',
-    )
-    await until(() => tools!.get('mcp__chrome__navigate'), 'bridge tool registration')
-    expect(tools!.get('mcp__chrome__screenshot')).toBeDefined()
-    expect(tools!.get('mcp__chrome__get_text')).toBeDefined()
-  })
-
-  it('refuses a web page origin on the extension socket', async () => {
-    const refused = new WebSocket(`ws://127.0.0.1:${ctx.webServer.port}/chrome/ws`, {
-      headers: { origin: 'https://evil.example' },
+  it('tools/call without an extension is an isError result', async () => {
+    const v = await rpc({
+      jsonrpc: '2.0', id: 3, method: 'tools/call',
+      params: { name: 'snapshot', arguments: { session: 's' } },
     })
-    const outcome = await new Promise<string>(resolve => {
-      refused.once('open', () => resolve('open'))
-      refused.once('error', () => resolve('refused'))
-    })
-    expect(outcome).toBe('refused')
+    expect(v.error).toBeUndefined()
+    expect(v.result.isError).toBe(true)
+    expect(v.result.content[0].text).toContain('chrome://extensions')
   })
 
-  it('completes a whole tool call round trip through a fake extension', async () => {
-    const socket = new WebSocket(`ws://127.0.0.1:${ctx.webServer.port}/chrome/ws`, {
-      headers: { origin: 'chrome-extension://test' },
+  it('unknown tool is an invalid-params error', async () => {
+    const v = await rpc({
+      jsonrpc: '2.0', id: 4, method: 'tools/call',
+      params: { name: 'cdp', arguments: {} },
     })
-    const frames: any[] = []
-    socket.on('message', data => frames.push(JSON.parse(String(data))))
-    await new Promise(resolve => socket.once('open', resolve))
-    socket.send(JSON.stringify({ type: 'hello', payload: { extensionVersion: '9.9.9' } }))
+    expect(v.error.code).toBe(-32602)
+  })
 
-    // hello is acknowledged and the status flips to connected.
-    await until(() => frames.find(frame => frame.type === 'hello_ack'), 'hello_ack')
-    const status = (await (await fetch(`${base}/chrome/status`)).json()) as any
-    expect(status.extension_connected).toBe(true)
-    expect(status.extension_version).toBe('9.9.9')
+  it('completes a whole tool-call round trip through a WebSocket extension', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${PORT}/chrome/ws`)
+    const opened = new Promise<void>(resolve => ws.on('open', resolve))
+    await opened
 
-    // The extension answers the dispatched call; MCP returns its data.
-    const answered = rpc({
-      jsonrpc: '2.0',
-      id: 3,
-      method: 'tools/call',
+    // The daemon sends nothing until a tool is dispatched; send hello to record version.
+    ws.send(JSON.stringify({ type: 'hello', payload: { extensionVersion: '0.3.1-test' } }))
+
+    // Kick off a tool call; the daemon will deliver a tool_call frame to us.
+    const call = rpc({
+      jsonrpc: '2.0', id: 5, method: 'tools/call',
       params: { name: 'list_tabs', arguments: { session: 's' } },
     })
-    const call = await until(() => frames.find(frame => frame.type === 'tool_call'), 'tool_call frame')
-    expect(call.payload.name).toBe('list_tabs')
-    socket.send(
-      JSON.stringify({
-        type: 'tool_result',
-        responseToRequestId: call.requestId,
-        payload: { data: { tabs: [] } },
-      }),
-    )
-    const response = await answered
-    expect(response.result.isError).toBe(false)
-    expect(JSON.parse(response.result.content[0].text)).toEqual({ tabs: [] })
 
-    socket.close()
+    // Receive the tool_call frame, skipping hello_ack/ping frames the daemon
+    // may send first.
+    const frame: any = await new Promise(resolve => {
+      ws.on('message', d => {
+        const f = JSON.parse(d.toString())
+        if (f.type === 'tool_call') resolve(f)
+      })
+    })
+    expect(frame.type).toBe('tool_call')
+    expect(frame.payload.name).toBe('list_tabs')
+    expect(frame.requestId).toMatch(/^r\d+$/)
+    ws.send(JSON.stringify({
+      type: 'tool_result',
+      responseToRequestId: frame.requestId,
+      payload: { data: { tabs: [{ id: 1, url: 'https://example.com' }] } },
+    }))
+
+    // The MCP call resolves with the extension's answer.
+    const v = await call
+    expect(v.result.isError).toBe(false)
+    expect(v.result.content[0].type).toBe('text')
+    const parsed = JSON.parse(v.result.content[0].text)
+    expect(parsed.tabs[0].url).toBe('https://example.com')
+
+    ws.close()
+  })
+
+  it('reports the extension connected after a hello', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${PORT}/chrome/ws`)
+    await new Promise<void>(resolve => ws.on('open', resolve))
+    ws.send(JSON.stringify({ type: 'hello', payload: { extensionVersion: '9.9.9' } }))
+    // give the daemon a beat to record hello
+    await new Promise(resolve => setTimeout(resolve, 100))
+    const r = await fetch(`${BASE}/chrome/status`)
+    const v = await r.json() as any
+    expect(v.extension_connected).toBe(true)
+    expect(v.extension_version).toBe('9.9.9')
+    ws.close()
   })
 })

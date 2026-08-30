@@ -47,6 +47,12 @@ that.
   (port 37086) is no longer used. If one is still running, stop it with
   `~/.dsh-chrome/bin/chrome-daemon stop` and delete `~/.dsh-chrome`; this
   plugin never kills processes it does not own.
+- **Response size guards.** Text tool results are capped at 256 KiB (with a
+  trailing `[truncated]` marker) and top-level arrays past 4000 elements are
+  sliced; the extension WebSocket frame limit is 8 MiB. These keep a giant
+  `snapshot` full outline or `get_text` dump from stalling the shared `dsh web`
+  event loop. For very large pages, narrow `snapshot` to a subtree (or pass a
+  container ref), or prefer `get_text`.
 
 ## Tools
 

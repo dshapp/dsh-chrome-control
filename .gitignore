@@ -3,3 +3,6 @@ node_modules/
 *.log
 .env
 .env.*
+
+# CI-built per-platform daemon binaries (published in the npm tarball, not in git)
+/binaries/

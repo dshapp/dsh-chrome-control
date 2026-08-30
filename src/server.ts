@@ -1,33 +1,30 @@
 /**
- * The dsh-chrome server plugin: mounts the extension bridge on the harness's
- * own web server instead of a separate daemon process.
+ * The dsh-chrome server plugin: spawns the standalone Rust `chrome-daemon`
+ * process and points the in-box MCP bridge at it. The bridge no longer runs
+ * in-process — all WebSocket pumping, tool dispatch, and serialization live
+ * in the daemon (serde_json on real OS threads, no GC, no shared event loop).
  *
- * Three routes ride the shared `webServer` (the same HTTP service that serves
- * the Web GUI, default port 3080):
+ * dsh web stays responsible for two things:
+ *   1. spawning the daemon child and killing it on unload;
+ *   2. registering the in-box `@deepseek-ai/dsh-mcp-client` against the
+ *      daemon's own `/chrome/mcp` (port 37086), so the agent sees
+ *      `mcp__chrome__*` tools.
  *
- *   - `POST /chrome/mcp`   — the MCP Streamable HTTP endpoint;
- *   - `GET  /chrome/ws`    — the browser extension's WebSocket;
- *   - `GET  /chrome/status` — liveness and wiring probe.
- *
- * The agent-facing tools still come from the in-box
- * `@deepseek-ai/dsh-mcp-client` bridge — loaded here programmatically and
- * pointed at this process's own `/chrome/mcp`, using the web server's *actual*
- * listening port so the two can never disagree.
+ * A `/chrome/status` proxy is mounted on the shared web server so the GUI's
+ * liveness probe still works on port 3080 without reaching across ports.
  *
  * @module dsh-chrome/server
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import type { Duplex } from 'node:stream'
+import { spawn, type ChildProcess } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import * as http from 'node:http'
+import * as path from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import * as McpClient from '@deepseek-ai/dsh-mcp-client'
 // Type-only: contributes the `webServer` service augmentation to Context.
 import type {} from '@deepseek-ai/dsh-host-webserver'
-import { WebSocketServer, type WebSocket } from 'ws'
-
-import { DispatchError, Hub } from './hub.ts'
-import { handle, parseFailure, SERVER_NAME, PROTOCOL_VERSION, serverVersion } from './mcp.ts'
-import { parseClientFrame, type Json, type ServerFrame } from './protocol.ts'
 
 /** Stable Cordis plugin name. */
 export const name = 'chrome-server'
@@ -35,206 +32,130 @@ export const name = 'chrome-server'
 /** The bridge cannot mount routes before the web server exists. */
 export const inject = ['webServer']
 
-/** How long one tool call may wait for the extension. */
-export const TOOL_TIMEOUT_MS = 30_000
+/** The daemon's fixed port. The extension's `dsh_chrome_url` default matches. */
+export const DAEMON_PORT = 37086
 
-/** Where the three routes live on the shared server. */
-export const MCP_PATH = '/chrome/mcp'
-export const WS_PATH = '/chrome/ws'
-export const STATUS_PATH = '/chrome/status'
-
-/** Keepalive interval for a silent MV3 service worker. */
-const PING_INTERVAL_MS = 30_000
+/** Where the three routes live on the daemon. */
+const MCP_PATH = '/chrome/mcp'
+const STATUS_PATH = '/chrome/status'
 
 /**
- * Only a browser extension page may open the control socket. Chrome sends
- * `Origin: chrome-extension://<id>`; anything else — notably a web page that
- * found the endpoint — is refused. A non-browser client (tests, curl) sends no
- * Origin at all and is allowed.
+ * The in-box MCP bridge's config, pointed at the daemon's own port. The URL
+ * and the endpoint can never disagree — both are the daemon's fixed port.
  */
-export function originAllowed(origin: string | undefined): boolean {
-  if (origin === undefined) return true
-  return origin.startsWith('chrome-extension://')
-}
-
-/**
- * The in-box MCP bridge's config, derived from the web server's actual port so
- * the URL and the endpoint can never disagree.
- */
-export function bridgeConfig(port: number): McpClient.StreamableHttpConfig {
+export function bridgeConfig(): McpClient.StreamableHttpConfig {
   return {
     serverName: 'chrome',
     transport: 'streamable-http',
-    url: `http://127.0.0.1:${port}${MCP_PATH}`,
+    url: `http://127.0.0.1:${DAEMON_PORT}${MCP_PATH}`,
     headers: {},
-    // Above the hub's own timeout, so its actionable message wins the race.
-    toolCallTimeoutMs: TOOL_TIMEOUT_MS + 5_000,
-    // The extension may attach later; a failed first connect must not abort
+    // Above the hub's own 30 s timeout, so its actionable message wins the race.
+    toolCallTimeoutMs: 35_000,
+    // The daemon may still be starting up; a failed first connect must not abort
     // the profile. The bridge's reconnect policy attaches when we answer.
     failOnStartupError: false,
   }
 }
 
-/** Read one request body as UTF-8 text. */
-function readBody(req: IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = []
-    req.on('data', chunk => chunks.push(chunk as Buffer))
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
-    req.on('error', reject)
-  })
-}
-
-function sendJson(res: ServerResponse, status: number, body: Json): void {
-  const text = JSON.stringify(body)
-  res.writeHead(status, {
-    'content-type': 'application/json',
-    'content-length': Buffer.byteLength(text),
-  })
-  res.end(text)
-}
+/** Per-platform binary name: Windows needs the `.exe` suffix. */
+const EXE = process.platform === 'win32' ? 'chrome-daemon.exe' : 'chrome-daemon'
+/** Platform-arch tuple matching the CI matrix output layout under `binaries/`. */
+const PLATFORM_ARCH = `${process.platform}-${process.arch}`
 
 /**
- * MCP requests. A notification yields 202 with an empty body; everything else
- * answers with `application/json`, which the Streamable HTTP client accepts.
- * The client may try to open a server-to-client SSE stream with GET; this
- * server never initiates messages, so 405 declines and the client proceeds.
+ * Resolve the chrome-daemon binary: the shipped per-platform copy first, then
+ * a dev build beside the plugin, then the legacy install dir.
  */
-function createMcpHandler(hub: Hub) {
-  return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-    if (req.method !== 'POST') {
-      res.writeHead(405)
-      res.end()
-      return
-    }
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(await readBody(req))
-    } catch (failure) {
-      sendJson(res, 400, parseFailure(String(failure instanceof Error ? failure.message : failure)))
-      return
-    }
-    const response = await handle(parsed, hub)
-    if (response === undefined) {
-      res.writeHead(202)
-      res.end()
-      return
-    }
-    sendJson(res, 200, response)
+function resolveBinary(): string | undefined {
+  const here = path.dirname(new URL('.', import.meta.url).pathname)
+  const candidates = [
+    // shipped: the CI matrix drops each platform's binary under binaries/<platform>-<arch>/
+    path.resolve(here, '..', 'binaries', PLATFORM_ARCH, EXE),
+    // dev: built beside the plugin
+    path.resolve(here, '..', 'daemon', 'target', 'release', EXE),
+    // legacy install dir
+    path.resolve(process.env.HOME ?? '', '.dsh-chrome', 'bin', EXE),
+  ]
+  return candidates.find(p => existsSync(p))
+}
+
+/** Probe whether a daemon is already listening (dev-friendly: reuse it). */
+function probeRunning(): Promise<boolean> {
+  return new Promise(resolve => {
+    const req = http.get(
+      { host: '127.0.0.1', port: DAEMON_PORT, path: STATUS_PATH, timeout: 800 },
+      res => { res.resume(); res.on('end', () => resolve(res.statusCode === 200)) },
+    )
+    req.on('error', () => resolve(false))
+    req.on('timeout', () => { req.destroy(); resolve(false) })
+  })
+}
+
+/** Spawn the daemon child, wiring its stdio into the harness logger. */
+function startDaemon(log: Context['logger']): ChildProcess | undefined {
+  const bin = resolveBinary()
+  if (bin === undefined) {
+    log?.error('chrome-daemon binary not found; the agent will not see mcp__chrome__* tools')
+    return undefined
   }
+  const child = spawn(bin, ['--port', String(DAEMON_PORT), '--host', '127.0.0.1'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  child.stdout.on('data', d => log?.info(`[chrome-daemon] ${d.toString().trimEnd()}`))
+  child.stderr.on('data', d => log?.warn(`[chrome-daemon] ${d.toString().trimEnd()}`))
+  child.on('exit', code => { log?.info(`chrome-daemon exited code=${code}`) })
+  log?.info(`chrome-daemon spawned: ${bin} (pid ${child.pid})`)
+  return child
 }
 
-/**
- * Liveness and wiring probe: confirms the endpoint is ours and reports whether
- * the extension is attached. The shape matches the old daemon's `/status`.
- */
-function createStatusHandler(hub: Hub, startedAt: number) {
-  return (_req: IncomingMessage, res: ServerResponse): void => {
-    const extension = hub.extensionState()
-    sendJson(res, 200, {
-      name: SERVER_NAME,
-      version: serverVersion(),
-      protocolVersion: PROTOCOL_VERSION,
-      running: true,
-      extension_connected: extension.connected,
-      extension_version: extension.version,
-      uptime_seconds: Math.floor((Date.now() - startedAt) / 1000),
+/** Proxy `/chrome/status` on the shared web server to the daemon. */
+function createStatusProxyHandler(): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
+  return async (_req, res) => {
+    const proxy = http.request(
+      { host: '127.0.0.1', port: DAEMON_PORT, path: STATUS_PATH, method: 'GET', timeout: 3000 },
+      upstream => {
+        res.writeHead(upstream.statusCode ?? 502, upstream.headers)
+        upstream.pipe(res)
+      },
+    )
+    proxy.on('error', () => {
+      res.writeHead(503, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ name: 'dsh-chrome', running: false, extension_connected: false }))
     })
+    proxy.on('timeout', () => { proxy.destroy(); res.writeHead(504); res.end() })
+    proxy.end()
   }
-}
-
-/** Pump one extension socket until it closes. */
-function serveExtension(socket: WebSocket, hub: Hub, log: Context['logger']): void {
-  const outbound = (frame: ServerFrame): boolean => {
-    if (socket.readyState !== socket.OPEN) return false
-    try {
-      socket.send(JSON.stringify(frame))
-      return true
-    } catch {
-      return false
-    }
-  }
-  hub.attach(outbound)
-  log?.info('chrome extension connected')
-
-  // Keepalive: a silent MV3 service worker is indistinguishable from a live
-  // one until a probe fails, so probe on an interval.
-  const pinger = setInterval(() => hub.ping(), PING_INTERVAL_MS)
-
-  socket.on('message', data => {
-    const frame = parseClientFrame(String(data))
-    if (frame === undefined) {
-      log?.warn('invalid frame from extension')
-      return
-    }
-    switch (frame.type) {
-      case 'hello':
-        log?.info(`hello from extension ${frame.extensionVersion}`)
-        hub.recordHello(frame.extensionVersion)
-        outbound({ type: 'hello_ack' })
-        break
-      case 'pong':
-        break
-      case 'tool_result':
-        hub.resolve(
-          frame.responseToRequestId,
-          frame.error !== undefined
-            ? new DispatchError('tool', frame.error)
-            : (frame.data ?? null),
-        )
-        break
-    }
-  })
-  socket.on('error', () => {})
-  socket.on('close', () => {
-    clearInterval(pinger)
-    hub.detach(outbound)
-    log?.info('chrome extension disconnected')
-  })
 }
 
 /**
- * Mount the bridge on the shared web server and load the in-box MCP client
- * against it.
+ * Spawn the daemon, mount the status proxy, and load the in-box MCP client.
  * @param ctx - plugin context carrying the webServer service.
  */
 export function apply(ctx: Context): void {
-  const hub = new Hub(TOOL_TIMEOUT_MS)
-  const startedAt = Date.now()
-  const wss = new WebSocketServer({ noServer: true })
+  const log = ctx.logger
+  let child: ChildProcess | undefined
+
+  void (async () => {
+    const running = await probeRunning()
+    if (!running) child = startDaemon(log)
+    else log?.info('chrome-daemon already running; reusing it')
+  })()
 
   ctx.effect(() =>
-    ctx.webServer.register({ kind: 'exact', path: MCP_PATH, handler: createMcpHandler(hub) }),
+    ctx.webServer.register({ kind: 'exact', path: STATUS_PATH, handler: createStatusProxyHandler() }),
   )
-  ctx.effect(() =>
-    ctx.webServer.register({
-      kind: 'exact',
-      path: STATUS_PATH,
-      handler: createStatusHandler(hub, startedAt),
-    }),
-  )
-  ctx.effect(() =>
-    ctx.webServer.registerUpgrade({
-      path: WS_PATH,
-      handler: (req: IncomingMessage, socket: Duplex, head: Buffer) => {
-        const origin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined
-        if (!originAllowed(origin)) {
-          ctx.logger?.warn('rejected a websocket upgrade from a disallowed origin')
-          socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n')
-          socket.destroy()
-          return
-        }
-        wss.handleUpgrade(req, socket, head, ws => serveExtension(ws, hub, ctx.logger))
-      },
-    }),
-  )
-  // Sever live sockets when the plugin unloads, so a reload re-attaches cleanly.
+
+  // Sever the child and live sockets when the plugin unloads.
   ctx.effect(() => () => {
-    for (const client of wss.clients) client.terminate()
-    wss.close()
+    if (child !== undefined && !child.killed) {
+      child.kill('SIGTERM')
+    }
   })
 
-  // The whole agent-facing tool surface: the in-box MCP bridge, pointed at our
-  // own endpoint on the web server's actual listening port.
-  ctx.plugin(McpClient, bridgeConfig(ctx.webServer.port))
+  // The whole agent-facing tool surface: the in-box MCP bridge, pointed at the
+  // daemon's own endpoint on its fixed port.
+  ctx.plugin(McpClient, bridgeConfig())
 }
+
+// Re-exported so the test suite can parse frames the way the daemon does.
+export { parseClientFrame } from './protocol.ts'

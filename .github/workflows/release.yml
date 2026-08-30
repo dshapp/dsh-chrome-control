@@ -142,15 +142,27 @@ jobs:
           LOCAL_VERSION="$(node -p "require('./package.json').version")"
           PUBLISHED_VERSION="$(npm view "$PACKAGE_NAME" version 2>/dev/null || true)"
 
-          if [[ "$LOCAL_VERSION" == "$PUBLISHED_VERSION" ]]; then
-            npm version patch --no-git-tag-version --ignore-scripts
+          # Publish package.json's version if npm has never seen it. Otherwise
+          # bump to the next patch above the latest of (local, published) — the
+          # version-bump commit may not land on the protected main branch, so
+          # package.json can lag behind what npm already shipped.
+          if [[ -z "$PUBLISHED_VERSION" ]]; then
+            VERSION="$LOCAL_VERSION"
+          elif npm view "$PACKAGE_NAME@$LOCAL_VERSION" version >/dev/null 2>&1; then
+            # local already shipped — bump past the newer of local/published
+            HIGHEST="$(printf "%s\n%s\n" "$LOCAL_VERSION" "$PUBLISHED_VERSION" | sort -V | tail -1)"
+            VERSION="$(node -e "const s='$HIGHEST'.split('.');const b=s[0]+'.'+s[1]+'.'+(Number(s[2])+1);process.stdout.write(b)")"
+          else
+            VERSION="$LOCAL_VERSION"
           fi
 
-          VERSION="$(node -p "require('./package.json').version")"
           if npm view "$PACKAGE_NAME@$VERSION" version >/dev/null 2>&1; then
             echo "Refusing to overwrite existing $PACKAGE_NAME@$VERSION" >&2
             exit 1
           fi
+
+          # Write the resolved version back so npm publish ships it.
+          npm version "$VERSION" --no-git-tag-version --ignore-scripts
 
           echo "package=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -159,19 +171,27 @@ jobs:
       - name: Publish to npm
         run: npm publish --access public --provenance
 
-      - name: Commit version and create tag
+      - name: Create release tag
         env:
           TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Bump the version in package.json locally and tag it. We do NOT push
+          # the commit to main — that branch is protected (requires a passing
+          # "Test" status check the bot commit cannot satisfy). The tag carries
+          # the release identity and is pushed directly (tags are not subject to
+          # branch protection). To keep package.json in sync on main, either:
+          #   (a) allow this workflow's GITHUB_TOKEN to bypass branch protection
+          #       (Settings → Branches → main → "Allow specified actors to bypass"),
+          #   (b) add this bot to a team with bypass, or
+          #   (c) manually merge the bumped version after each release.
           git add package.json pnpm-lock.yaml
           if ! git diff --cached --quiet; then
             git commit -m "chore(release): $TAG [skip ci]"
           fi
           git tag -a "$TAG" -m "$TAG"
-          git push origin HEAD:main
           git push origin "$TAG"
 
       - name: Create full changelog

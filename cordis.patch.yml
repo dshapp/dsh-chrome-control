@@ -1,0 +1,20 @@
+# dsh-chrome bundle: two rows that together give the agent control of the
+# user's real Chrome.
+#
+#   1. the server row mounts the extension bridge on the harness's own web
+#      server (default port 3080): POST /chrome/mcp (MCP Streamable HTTP),
+#      GET /chrome/ws (the extension's WebSocket), GET /chrome/status. It also
+#      loads the in-box mcp-client bridge against its own /chrome/mcp — using
+#      the web server's *actual* listening port, so no port is written here —
+#      which publishes the catalog as mcp__chrome__* with no adapter code;
+#   2. the skills row teaches the agent how to drive those tools.
+#
+# The browser extension is installed by the user, by design: loading an
+# unpacked extension is a decision only the browser's owner can make. Point
+# its "DSH server" address at the same dsh web URL.
+- insert:
+    - id: chrome-server
+      name: 'dsh-chrome-control/server'
+
+    - id: chrome-skills
+      name: 'dsh-chrome-control/skills'

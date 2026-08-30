@@ -7,7 +7,7 @@
  */
 
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { chmodSync, existsSync } from 'node:fs'
 import * as path from 'node:path'
 import WebSocket from 'ws'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -58,6 +58,8 @@ const HAS_BINARY = BIN !== undefined
 
 beforeAll(async () => {
   if (!HAS_BINARY) return
+  // artifact upload/download drops the executable bit on non-Windows
+  if (process.platform !== 'win32') chmodSync(BIN!, 0o755)
   child = spawn(BIN!, ['--port', String(PORT), '--host', '127.0.0.1'], { stdio: 'ignore' })
   await untilReady()
 }, 30_000)

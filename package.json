@@ -4,6 +4,14 @@
   "description": "DeepSeek Harness (DSH) bundle: mounts the Chrome extension bridge (MCP endpoint + extension WebSocket) on the harness's own web server, exposing the user's real Chrome to the agent as mcp__chrome__* tools.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dshapp/dsh-chrome-control.git"
+  },
+  "homepage": "https://github.com/dshapp/dsh-chrome-control#readme",
+  "bugs": {
+    "url": "https://github.com/dshapp/dsh-chrome-control/issues"
+  },
   "publishConfig": {
     "access": "public"
   },

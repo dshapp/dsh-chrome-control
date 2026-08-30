@@ -106,6 +106,8 @@ jobs:
           test -f binaries/darwin-arm64/chrome-daemon
           test -f binaries/linux-x64/chrome-daemon
           test -f binaries/win32-x64/chrome-daemon.exe
+          # artifact upload/download drops the executable bit on non-Windows
+          chmod +x binaries/darwin-arm64/chrome-daemon binaries/linux-x64/chrome-daemon
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4

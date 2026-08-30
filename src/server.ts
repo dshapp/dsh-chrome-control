@@ -18,7 +18,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { spawn, type ChildProcess } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { chmodSync, existsSync } from 'node:fs'
 import * as http from 'node:http'
 import * as path from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -97,6 +97,10 @@ function startDaemon(log: Context['logger']): ChildProcess | undefined {
   if (bin === undefined) {
     log?.error('chrome-daemon binary not found; the agent will not see mcp__chrome__* tools')
     return undefined
+  }
+  // npm tarball extraction can drop the executable bit on non-Windows.
+  if (process.platform !== 'win32') {
+    try { chmodSync(bin, 0o755) } catch { /* may already be executable / readonly */ }
   }
   const child = spawn(bin, ['--port', String(DAEMON_PORT), '--host', '127.0.0.1'], {
     stdio: ['ignore', 'pipe', 'pipe'],

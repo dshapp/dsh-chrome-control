@@ -54,7 +54,11 @@ export const TOOLS: readonly ToolSpec[] = [
       "Open a URL in the user's real Chrome. The first call in a session creates the session's tab group.",
     inputSchema: withSession(
       {
-        url: { type: 'string', description: 'Absolute http(s) URL to open.' },
+        url: {
+          type: 'string',
+          description:
+            'Any absolute URL the browser can open — http(s), file:, about:, data:, or an internal scheme like chrome:. Privileged pages (chrome:// and friends) open as real tabs, but page-reading tools cannot attach to them.',
+        },
         newTab: {
           type: 'boolean',
           description:

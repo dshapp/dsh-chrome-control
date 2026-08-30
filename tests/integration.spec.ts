@@ -12,7 +12,18 @@ import * as path from 'node:path'
 import WebSocket from 'ws'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
-const BIN = path.resolve(import.meta.dirname, '..', 'daemon', 'target', 'release', 'chrome-daemon')
+// Resolve the daemon binary the same way the plugin does: the shipped
+// per-platform copy under binaries/ first, then a dev cargo build. On the
+// release job the binaries/ dir is populated from the matrix artifacts; on
+// PR-checks and dev the cargo build is used. Skip the suite if neither is
+// present (e.g. a job that only validates packaging without building).
+const EXE = process.platform === 'win32' ? 'chrome-daemon.exe' : 'chrome-daemon'
+const PLATFORM_ARCH = `${process.platform}-${process.arch}`
+const BINARY_CANDIDATES = [
+  path.resolve(import.meta.dirname, '..', 'binaries', PLATFORM_ARCH, EXE),
+  path.resolve(import.meta.dirname, '..', 'daemon', 'target', 'release', EXE),
+]
+const BIN = BINARY_CANDIDATES.find(p => existsSync(p))
 const PORT = 37187 // ephemeral test port, avoids clashing with a running daemon
 const BASE = `http://127.0.0.1:${PORT}`
 
@@ -40,17 +51,23 @@ async function rpc(body: unknown): Promise<any> {
   return response.json()
 }
 
+// Skip the whole suite when no binary is available (e.g. a job that only
+// validates packaging without building Rust). On the release job the binaries/
+// dir is populated from the matrix artifacts; on PR-checks a cargo build runs.
+const HAS_BINARY = BIN !== undefined
+
 beforeAll(async () => {
-  if (!existsSync(BIN)) throw new Error(`release binary missing: ${BIN}; run cargo build --release`)
-  child = spawn(BIN, ['--port', String(PORT), '--host', '127.0.0.1'], { stdio: 'ignore' })
+  if (!HAS_BINARY) return
+  child = spawn(BIN!, ['--port', String(PORT), '--host', '127.0.0.1'], { stdio: 'ignore' })
   await untilReady()
-})
+}, 30_000)
 
 afterAll(() => {
   if (child !== undefined && !child.killed) child.kill('SIGTERM')
 })
 
-describe('chrome-daemon (end-to-end)', () => {
+const describe_e2e = HAS_BINARY ? describe : describe.skip
+describe_e2e('chrome-daemon (end-to-end)', () => {
   it('GET /chrome/status reports the wiring', async () => {
     const r = await fetch(`${BASE}/chrome/status`)
     expect(r.status).toBe(200)

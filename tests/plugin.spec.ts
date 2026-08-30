@@ -237,14 +237,54 @@ describe('mcp layer', () => {
     expect(response.result.content[0].text).toContain('chrome://extensions')
   })
 
-  it('renders ordinary tool results as compact JSON', () => {
-    const rendered = toolContent({ url: 'https://example.com', tabId: 7 }) as any
+  it('renders ordinary tool results as compact JSON', async () => {
+    const rendered = (await toolContent({ url: 'https://example.com', tabId: 7 })) as any
     expect(rendered.content[0].type).toBe('text')
     const text: string = rendered.content[0].text
     expect(text.startsWith('{')).toBe(true)
     expect(text).toContain('https://example.com')
     // Compact, so a large snapshot is not inflated by indentation.
     expect(text).not.toContain('\n')
+  })
+
+  it('caps a top-level array past the element limit and keeps legal JSON', async () => {
+    const big = Array.from({ length: 5000 }, (_, i) => `item-${i}`)
+    const rendered = (await toolContent(big as any)) as any
+    const text: string = rendered.content[0].text
+    const parsed = JSON.parse(text) as unknown[]
+    expect(parsed.length).toBe(4001)
+    expect(parsed[0]).toBe('item-0')
+    expect(parsed[3999]).toBe('item-3999')
+    expect(typeof parsed[4000]).toBe('string')
+    expect(parsed[4000]).toContain('truncated')
+  })
+
+  it('truncates oversized text output and marks the tail', async () => {
+    const huge = 'x'.repeat(300 * 1024)
+    const rendered = (await toolContent(huge as any)) as any
+    const text: string = rendered.content[0].text
+    expect(text.length).toBe(256 * 1024 + '\n…[truncated by dsh-chrome-control]'.length)
+    expect(text.endsWith('…[truncated by dsh-chrome-control]')).toBe(true)
+  })
+
+  it('renders an image answer as an image block without stringify', async () => {
+    const rendered = (await toolContent({
+      __image_base64: 'Zm9v',
+      __image_mime_type: 'image/png',
+    } as any)) as any
+    expect(rendered.content[0].type).toBe('image')
+    expect(rendered.content[0].data).toBe('Zm9v')
+    expect(rendered.content[0].mimeType).toBe('image/png')
+  })
+
+  it('serializes a moderately large object through the worker path', async () => {
+    // Large enough to trigger the offload heuristic; correctness is the only
+    // assertion — we do not couple to whether a worker is actually spun up.
+    const value = Array.from({ length: 512 }, (_, i) => ({ i, label: `row-${i}` }))
+    const rendered = (await toolContent(value as any)) as any
+    const parsed = JSON.parse(rendered.content[0].text) as Array<{ i: number }>
+    expect(parsed.length).toBe(512)
+    expect(parsed[511]!.i).toBe(511)
   })
 })
 

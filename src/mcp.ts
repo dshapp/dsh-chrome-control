@@ -11,6 +11,9 @@
  * @module dsh-chrome/mcp
  */
 
+import { createRequire } from 'node:module'
+import { Worker } from 'node:worker_threads'
+
 import { DispatchError, type Hub } from './hub.ts'
 import type { Json } from './protocol.ts'
 import { isKnown, listPayload } from './tools-catalog.ts'
@@ -45,10 +48,134 @@ export function parseFailure(message: string): Json {
   return rpcError(null, CODES.PARSE_ERROR, `parse error: ${message}`)
 }
 
-/** A tool outcome rendered as MCP content. */
-export function toolContent(value: Json): Json {
+/**
+ * Hard-coded guards against a single oversized extension answer stalling the
+ * `dsh web` event loop. The classic offender is a `snapshot` mode:"full"
+ * outline or a `get_text` raw dump: deeply-nested or multi-MB objects that
+ * keep V8's `JsonStringifier::Serialize_<true>` recursing on the main thread
+ * for seconds, during which Chrome reconnects pile up into a SYN storm.
+ *
+ * Three layers, cheap to expensive:
+ *   1. `capArray` slices a top-level array past {@link MAX_ARRAY_ELEMENTS} so
+ *      the serialized output is still legal JSON, just shorter.
+ *   2. Past the {@link WORKER_OFFLOAD} heuristics, `JSON.stringify` runs on a
+ *      persistent worker thread so the main loop keeps draining I/O.
+ *   3. The final text is clipped to {@link MAX_TEXT_BYTES} with a tail marker.
+ */
+const MAX_TEXT_BYTES = 256 * 1024
+const MAX_ARRAY_ELEMENTS = 4000
+const TRUNCATED_TAIL = '\n…[truncated by dsh-chrome-control]'
+
+/** Slice a top-level array past the cap, leaving objects and primitives alone. */
+function capArray(value: Json): Json {
+  if (Array.isArray(value) && value.length > MAX_ARRAY_ELEMENTS) {
+    return [
+      ...value.slice(0, MAX_ARRAY_ELEMENTS),
+      `…[truncated: ${value.length - MAX_ARRAY_ELEMENTS} more elements omitted by dsh-chrome-control]`,
+    ] as Json
+  }
+  return value
+}
+
+/**
+ * Heuristic: large enough that a synchronous stringify on the main loop is a
+ * risk. Strings are excluded — they are raw text (never quoted by `toolContent`)
+ * and a long string is a cheap linear copy, not a recursive stringify.
+ */
+function shouldOffload(value: Json): boolean {
+  if (Array.isArray(value)) return value.length > 256
+  if (value && typeof value === 'object') {
+    let count = 0
+    for (const _ in value) if (++count > 64) return true
+    return false
+  }
+  return false
+}
+
+const WORKER_SOURCE = `
+const { parentPort } = require('node:worker_threads')
+parentPort.on('message', msg => {
+  try {
+    parentPort.postMessage({ id: msg.id, text: JSON.stringify(msg.value) })
+  } catch (error) {
+    parentPort.postMessage({ id: msg.id, error: String(error) })
+  }
+})
+`
+
+interface Pending {
+  resolve: (text: string) => void
+  reject: (error: unknown) => void
+}
+
+let worker: Worker | undefined
+let workerPending: Map<number, Pending> | undefined
+let nextWorkerId = 1
+
+/** Lazily start the stringify worker; returns undefined if worker_threads is unavailable. */
+function getWorker(): Worker | undefined {
+  if (worker !== undefined) return worker
+  try {
+    const w = new Worker(WORKER_SOURCE, { eval: true })
+    const pending = new Map<number, Pending>()
+    workerPending = pending
+    w.on('message', msg => {
+      const entry = pending.get(msg.id)
+      if (entry === undefined) return
+      pending.delete(msg.id)
+      if (msg.error !== undefined) entry.reject(new Error(msg.error))
+      else entry.resolve(msg.text as string)
+    })
+    w.on('error', error => {
+      for (const entry of pending.values()) entry.reject(error)
+      pending.clear()
+    })
+    w.on('exit', () => {
+      for (const entry of pending.values()) entry.reject(new Error('serialize worker exited'))
+      pending.clear()
+      if (worker === w) {
+        worker = undefined
+        workerPending = undefined
+      }
+    })
+    worker = w
+    return w
+  } catch {
+    // worker_threads unavailable: callers fall back to inline stringify.
+    return undefined
+  }
+}
+
+function workerStringify(value: Json): Promise<string> {
+  const w = getWorker()
+  if (w === undefined || workerPending === undefined) {
+    return Promise.resolve(JSON.stringify(value) ?? 'null')
+  }
+  const id = nextWorkerId++
+  const pending = workerPending
+  return new Promise<string>((resolve, reject) => {
+    pending.set(id, { resolve, reject })
+    w.postMessage({ id, value })
+  })
+}
+
+/** Release the stringify worker; safe to call from plugin unload. */
+export function disposeSerializeWorker(): void {
+  if (worker !== undefined) {
+    void worker.terminate().catch(() => {})
+    worker = undefined
+    workerPending = undefined
+  }
+}
+
+/**
+ * A tool outcome rendered as MCP content. Async because a large result is
+ * stringified off the main thread; callers should `await` it.
+ */
+export async function toolContent(value: Json): Promise<Json> {
   // An image answer from the extension is handed to the model as a real
-  // image block; everything else travels as compact JSON text.
+  // image block; the base64 stays a string and only rides the envelope's
+  // linear escaping, so it does not need the worker path below.
   if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
     const data = value['__image_base64']
     const mime = value['__image_mime_type']
@@ -56,7 +183,23 @@ export function toolContent(value: Json): Json {
       return { content: [{ type: 'image', data, mimeType: mime }], isError: false }
     }
   }
-  const text = typeof value === 'string' ? value : JSON.stringify(value) ?? 'null'
+  const capped = capArray(value)
+  const text = shouldOffload(capped)
+    ? await workerStringify(capped)
+    : typeof capped === 'string'
+      ? capped
+      : (JSON.stringify(capped) ?? 'null')
+  if (text.length > MAX_TEXT_BYTES) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: text.slice(0, MAX_TEXT_BYTES) + TRUNCATED_TAIL,
+        },
+      ],
+      isError: false,
+    }
+  }
   return { content: [{ type: 'text', text }], isError: false }
 }
 
@@ -101,7 +244,7 @@ export async function handle(raw: unknown, hub: Hub): Promise<Json | undefined> 
       if (!isKnown(name)) return rpcError(id, CODES.INVALID_PARAMS, `unknown tool: ${name}`)
       const args = (params.arguments ?? {}) as Json
       try {
-        return result(id, toolContent(await hub.dispatch(name, args)))
+        return result(id, await toolContent(await hub.dispatch(name, args)))
       } catch (failure) {
         // Every dispatch failure is a tool-level outcome, so the model sees an
         // actionable message instead of a transport fault it cannot interpret.
@@ -114,8 +257,6 @@ export async function handle(raw: unknown, hub: Hub): Promise<Json | undefined> 
       return rpcError(id, CODES.METHOD_NOT_FOUND, `unknown method: ${method}`)
   }
 }
-
-import { createRequire } from 'node:module'
 
 let cachedVersion: string | undefined
 

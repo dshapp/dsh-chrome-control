@@ -26,7 +26,7 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import { WebSocketServer, type WebSocket } from 'ws'
 
 import { DispatchError, Hub } from './hub.ts'
-import { handle, parseFailure, SERVER_NAME, PROTOCOL_VERSION, serverVersion } from './mcp.ts'
+import { handle, disposeSerializeWorker, parseFailure, SERVER_NAME, PROTOCOL_VERSION, serverVersion } from './mcp.ts'
 import { parseClientFrame, type Json, type ServerFrame } from './protocol.ts'
 
 /** Stable Cordis plugin name. */
@@ -45,6 +45,15 @@ export const STATUS_PATH = '/chrome/status'
 
 /** Keepalive interval for a silent MV3 service worker. */
 const PING_INTERVAL_MS = 30_000
+
+/**
+ * Hard cap on a single extension WebSocket frame. An oversized `tool_result`
+ * (a multi-MB `snapshot` full tree, a `get_text` raw dump) would otherwise be
+ * buffered and parsed on the main thread, stalling the event loop until Chrome
+ * reconnects pile up. `ws` closes the socket past this limit and the hub's
+ * existing disconnect path fails any in-flight calls.
+ */
+const WS_MAX_PAYLOAD = 8 * 1024 * 1024
 
 /**
  * Only a browser extension page may open the control socket. Chrome sends
@@ -201,7 +210,7 @@ function serveExtension(socket: WebSocket, hub: Hub, log: Context['logger']): vo
 export function apply(ctx: Context): void {
   const hub = new Hub(TOOL_TIMEOUT_MS)
   const startedAt = Date.now()
-  const wss = new WebSocketServer({ noServer: true })
+  const wss = new WebSocketServer({ noServer: true, maxPayload: WS_MAX_PAYLOAD })
 
   ctx.effect(() =>
     ctx.webServer.register({ kind: 'exact', path: MCP_PATH, handler: createMcpHandler(hub) }),
@@ -232,6 +241,7 @@ export function apply(ctx: Context): void {
   ctx.effect(() => () => {
     for (const client of wss.clients) client.terminate()
     wss.close()
+    disposeSerializeWorker()
   })
 
   // The whole agent-facing tool surface: the in-box MCP bridge, pointed at our

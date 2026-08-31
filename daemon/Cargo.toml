@@ -1,6 +1,6 @@
 [package]
 name = "chrome-daemon"
-version = "0.3.0"
+version = "0.3.2"
 edition = "2021"
 description = "DeepSeek Harness Chrome bridge: standalone Rust daemon exposing the user's real Chrome to the agent as mcp__chrome__* tools."
 license = "MIT"

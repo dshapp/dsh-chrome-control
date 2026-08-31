@@ -15,10 +15,63 @@ permissions:
   id-token: write
 
 jobs:
+  # Resolve the release version FIRST, so the Rust build can stamp it into the
+  # binary. Previously the version was only decided in the release job, long
+  # after cargo had compiled — which is why a shipped daemon reported whatever
+  # `daemon/Cargo.toml` happened to hold (e.g. package 0.3.1 vs daemon 0.3.0).
+  resolve-version:
+    name: Resolve release version
+    runs-on: ubuntu-latest
+    outputs:
+      package: ${{ steps.resolve.outputs.package }}
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Resolve release version
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE_NAME="$(node -p "require('./package.json').name")"
+          LOCAL_VERSION="$(node -p "require('./package.json').version")"
+          PUBLISHED_VERSION="$(npm view "$PACKAGE_NAME" version 2>/dev/null || true)"
+
+          # Publish package.json's version if npm has never seen it. Otherwise
+          # bump to the next patch above the latest of (local, published) — the
+          # version-bump commit may not land on the protected main branch, so
+          # package.json can lag behind what npm already shipped.
+          if [[ -z "$PUBLISHED_VERSION" ]]; then
+            VERSION="$LOCAL_VERSION"
+          elif npm view "$PACKAGE_NAME@$LOCAL_VERSION" version >/dev/null 2>&1; then
+            # local already shipped — bump past the newer of local/published
+            HIGHEST="$(printf "%s\n%s\n" "$LOCAL_VERSION" "$PUBLISHED_VERSION" | sort -V | tail -1)"
+            VERSION="$(node -e "const s='$HIGHEST'.split('.');const b=s[0]+'.'+s[1]+'.'+(Number(s[2])+1);process.stdout.write(b)")"
+          else
+            VERSION="$LOCAL_VERSION"
+          fi
+
+          if npm view "$PACKAGE_NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "Refusing to overwrite existing $PACKAGE_NAME@$VERSION" >&2
+            exit 1
+          fi
+
+          echo "package=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
   # Build the Rust daemon for each target platform/arch. The binaries are
   # uploaded as artifacts and merged into the npm tarball by the release job.
   build-binary:
     name: Build daemon (${{ matrix.platform }}-${{ matrix.arch }})
+    needs: resolve-version
     strategy:
       fail-fast: false
       matrix:
@@ -56,6 +109,24 @@ jobs:
           key: cargo-${{ matrix.target }}-${{ hashFiles('daemon/Cargo.lock') }}
           restore-keys: cargo-${{ matrix.target }}-
 
+      # The daemon reports this as `version` in /chrome/status and as the MCP
+      # serverInfo version. Stamping it here — before cargo runs — is what keeps
+      # it honest; the release job's npm bump happens too late to reach the binary.
+      - name: Stamp the release version into Cargo.toml
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd daemon
+          # Only the [package] version: the first `version = "x.y.z"` line, which
+          # precedes [dependencies]. Anchored so no dependency pin is touched.
+          perl -0pi -e 's/^version = "[^"]+"/version = "$ENV{VERSION}"/m unless $done++' Cargo.toml
+          grep -m1 '^version' Cargo.toml
+          # Keep the lockfile's own entry consistent so --locked still applies.
+          cargo update -p chrome-daemon --precise "$VERSION" 2>/dev/null || cargo update -p chrome-daemon
+          grep -A1 'name = "chrome-daemon"' Cargo.lock
+
       - name: Build release binary
         working-directory: daemon
         run: cargo build --release --locked --target ${{ matrix.target }}
@@ -79,7 +150,7 @@ jobs:
 
   release:
     name: Publish to npm
-    needs: build-binary
+    needs: [resolve-version, build-binary]
     if: github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip ci]')
     runs-on: ubuntu-latest
     environment: npm
@@ -133,47 +204,25 @@ jobs:
           pnpm run check
           npm pack --dry-run --ignore-scripts
 
-      - name: Resolve release version
-        id: release
+      # The version was decided in resolve-version, before the daemon was built,
+      # so the binary and the npm package carry the same number. Apply it to
+      # package.json (and Cargo.toml, so the committed tree matches what shipped).
+      - name: Apply the resolved version
         shell: bash
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
         run: |
           set -euo pipefail
-          PACKAGE_NAME="$(node -p "require('./package.json').name")"
-          LOCAL_VERSION="$(node -p "require('./package.json').version")"
-          PUBLISHED_VERSION="$(npm view "$PACKAGE_NAME" version 2>/dev/null || true)"
-
-          # Publish package.json's version if npm has never seen it. Otherwise
-          # bump to the next patch above the latest of (local, published) — the
-          # version-bump commit may not land on the protected main branch, so
-          # package.json can lag behind what npm already shipped.
-          if [[ -z "$PUBLISHED_VERSION" ]]; then
-            VERSION="$LOCAL_VERSION"
-          elif npm view "$PACKAGE_NAME@$LOCAL_VERSION" version >/dev/null 2>&1; then
-            # local already shipped — bump past the newer of local/published
-            HIGHEST="$(printf "%s\n%s\n" "$LOCAL_VERSION" "$PUBLISHED_VERSION" | sort -V | tail -1)"
-            VERSION="$(node -e "const s='$HIGHEST'.split('.');const b=s[0]+'.'+s[1]+'.'+(Number(s[2])+1);process.stdout.write(b)")"
-          else
-            VERSION="$LOCAL_VERSION"
-          fi
-
-          if npm view "$PACKAGE_NAME@$VERSION" version >/dev/null 2>&1; then
-            echo "Refusing to overwrite existing $PACKAGE_NAME@$VERSION" >&2
-            exit 1
-          fi
-
-          # Write the resolved version back so npm publish ships it.
           npm version "$VERSION" --no-git-tag-version --ignore-scripts
-
-          echo "package=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          perl -0pi -e 's/^version = "[^"]+"/version = "$ENV{VERSION}"/m unless $done++' daemon/Cargo.toml
+          grep -m1 '^version' daemon/Cargo.toml
 
       - name: Publish to npm
         run: npm publish --access public --provenance
 
       - name: Create release tag
         env:
-          TAG: ${{ steps.release.outputs.tag }}
+          TAG: ${{ needs.resolve-version.outputs.tag }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -187,7 +236,7 @@ jobs:
           #       (Settings → Branches → main → "Allow specified actors to bypass"),
           #   (b) add this bot to a team with bypass, or
           #   (c) manually merge the bumped version after each release.
-          git add package.json pnpm-lock.yaml
+          git add package.json pnpm-lock.yaml daemon/Cargo.toml daemon/Cargo.lock
           if ! git diff --cached --quiet; then
             git commit -m "chore(release): $TAG [skip ci]"
           fi
@@ -196,7 +245,7 @@ jobs:
 
       - name: Create full changelog
         env:
-          TAG: ${{ steps.release.outputs.tag }}
+          TAG: ${{ needs.resolve-version.outputs.tag }}
         run: |
           set -euo pipefail
           PREVIOUS_TAG="$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)"
@@ -219,14 +268,14 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.release.outputs.tag }}
+          TAG: ${{ needs.resolve-version.outputs.tag }}
         run: gh release create "$TAG" --verify-tag --title "$TAG" --notes-file release-notes.md
 
       - name: Write summary
         env:
-          PACKAGE_NAME: ${{ steps.release.outputs.package }}
-          VERSION: ${{ steps.release.outputs.version }}
-          TAG: ${{ steps.release.outputs.tag }}
+          PACKAGE_NAME: ${{ needs.resolve-version.outputs.package }}
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+          TAG: ${{ needs.resolve-version.outputs.tag }}
         run: |
           echo "### Release $TAG" >> "$GITHUB_STEP_SUMMARY"
           echo "- npm: https://www.npmjs.com/package/$PACKAGE_NAME/v/$VERSION" >> "$GITHUB_STEP_SUMMARY"

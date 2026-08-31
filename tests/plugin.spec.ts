@@ -5,7 +5,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { bridgeConfig, DAEMON_PORT, parseClientFrame } from '../src/server.ts'
+import { bridgeConfig, DAEMON_PORT, localBuildHash, parseClientFrame, restartDecision } from '../src/server.ts'
 
 describe('chrome-server plugin', () => {
   describe('bridgeConfig', () => {
@@ -59,6 +59,54 @@ describe('chrome-server plugin', () => {
 
     it('returns undefined for a tool_result without a request id', () => {
       expect(parseClientFrame('{"type":"tool_result","payload":{"data":1}}')).toBeUndefined()
+    })
+  })
+  // The upgrade path: a detached daemon outlives dsh web, so after an upgrade
+  // the previous build is still listening. Version strings cannot detect that
+  // (releases bump package.json but never daemon/Cargo.toml), so the decision
+  // is made on the executable's content hash.
+  describe('restartDecision', () => {
+    const A = 'a'.repeat(64)
+    const B = 'b'.repeat(64)
+
+    it('reuses a daemon running the shipped build', () => {
+      expect(restartDecision(A, A)).toEqual({ restart: false, reason: 'match' })
+    })
+
+    it('restarts when the running build differs from the shipped one', () => {
+      expect(restartDecision(A, B)).toEqual({ restart: true, reason: 'changed' })
+    })
+
+    it('reuses when the running daemon reports no build id', () => {
+      // A daemon older than this plugin: it has no /chrome/shutdown either, so
+      // restarting it is not possible and must not be attempted.
+      expect(restartDecision(undefined, A)).toEqual({ restart: false, reason: 'unknown-running' })
+    })
+
+    it('reuses when the local binary cannot be hashed', () => {
+      expect(restartDecision(A, undefined)).toEqual({ restart: false, reason: 'unknown-local' })
+    })
+
+    it('never restarts on a double unknown', () => {
+      expect(restartDecision(undefined, undefined).restart) .toBe(false)
+    })
+  })
+
+  describe('localBuildHash', () => {
+    it('returns undefined for a missing file rather than throwing', () => {
+      expect(localBuildHash('/nonexistent/chrome-daemon')).toBeUndefined()
+    })
+
+    it('is a lowercase 64-char sha256 of the file', async () => {
+      const { createHash } = await import('node:crypto')
+      const { readFileSync, writeFileSync, mkdtempSync } = await import('node:fs')
+      const { tmpdir } = await import('node:os')
+      const pathMod = await import('node:path')
+      const file = pathMod.join(mkdtempSync(pathMod.join(tmpdir(), 'dsh-hash-')), 'bin')
+      writeFileSync(file, 'daemon bytes')
+      const expected = createHash('sha256').update(readFileSync(file)).digest('hex')
+      expect(localBuildHash(file)).toBe(expected)
+      expect(localBuildHash(file)).toMatch(/^[0-9a-f]{64}$/)
     })
   })
 })

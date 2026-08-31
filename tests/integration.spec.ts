@@ -7,7 +7,8 @@
  */
 
 import { spawn } from 'node:child_process'
-import { chmodSync, existsSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { chmodSync, existsSync, readFileSync } from 'node:fs'
 import * as path from 'node:path'
 import WebSocket from 'ws'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -77,6 +78,17 @@ describe_e2e('chrome-daemon (end-to-end)', () => {
     expect(v.name).toBe('dsh-chrome')
     expect(v.running).toBe(true)
     expect(v.extension_connected).toBe(false)
+  })
+
+  // The contract dsh web's upgrade check depends on: the daemon reports the
+  // SHA-256 of its own executable, so the Node side can reproduce it from the
+  // binary on disk and detect a daemon left over from an older build.
+  it('GET /chrome/status reports the executable content hash as `build`', async () => {
+    const r = await fetch(`${BASE}/chrome/status`)
+    const v = await r.json() as any
+    expect(v.build).toMatch(/^[0-9a-f]{64}$/)
+    const expected = createHash('sha256').update(readFileSync(BIN!)).digest('hex')
+    expect(v.build).toBe(expected)
   })
 
   it('initialize', async () => {
@@ -162,4 +174,68 @@ describe_e2e('chrome-daemon (end-to-end)', () => {
     expect(v.extension_version).toBe('9.9.9')
     ws.close()
   })
+})
+
+// POST /chrome/shutdown is how an upgraded dsh web retires a daemon it does
+// not own. These run against their own throwaway daemon on a separate port,
+// because a successful shutdown ends the process under test.
+describe_e2e('chrome-daemon shutdown endpoint', () => {
+  const SPORT = 37188
+  const SBASE = `http://127.0.0.1:${SPORT}`
+  let victim: ReturnType<typeof spawn> | undefined
+
+  async function untilUp(): Promise<void> {
+    const deadline = Date.now() + 10_000
+    for (;;) {
+      try { if ((await fetch(`${SBASE}/chrome/status`)).ok) return } catch {}
+      if (Date.now() > deadline) throw new Error('victim daemon did not start')
+      await new Promise(r => setTimeout(r, 100))
+    }
+  }
+
+  async function isDown(): Promise<boolean> {
+    try { await fetch(`${SBASE}/chrome/status`); return false } catch { return true }
+  }
+
+  beforeAll(async () => {
+    victim = spawn(BIN!, ['--port', String(SPORT), '--host', '127.0.0.1'], { stdio: 'ignore' })
+    await untilUp()
+  }, 30_000)
+
+  afterAll(() => {
+    if (victim !== undefined && !victim.killed) victim.kill('SIGTERM')
+  })
+
+  it('refuses a shutdown from a web page origin, and keeps running', async () => {
+    const r = await fetch(`${SBASE}/chrome/shutdown`, {
+      method: 'POST',
+      headers: { origin: 'https://evil.example' },
+    })
+    expect(r.status).toBe(403)
+    // Still alive: a hostile page must not be able to stop the daemon.
+    await new Promise(r => setTimeout(r, 200))
+    expect(await isDown()).toBe(false)
+  })
+
+  it('accepts a local shutdown and exits, releasing the port', async () => {
+    const r = await fetch(`${SBASE}/chrome/shutdown`, { method: 'POST' })
+    expect(r.status).toBe(202)
+
+    const deadline = Date.now() + 5_000
+    for (;;) {
+      if (await isDown()) break
+      if (Date.now() > deadline) throw new Error('daemon did not shut down')
+      await new Promise(r => setTimeout(r, 100))
+    }
+    expect(await isDown()).toBe(true)
+
+    // The port is genuinely free: a fresh daemon can bind it immediately.
+    const successor = spawn(BIN!, ['--port', String(SPORT), '--host', '127.0.0.1'], { stdio: 'ignore' })
+    try {
+      await untilUp()
+      expect((await fetch(`${SBASE}/chrome/status`)).status).toBe(200)
+    } finally {
+      successor.kill('SIGTERM')
+    }
+  }, 30_000)
 })

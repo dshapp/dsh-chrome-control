@@ -4,5 +4,8 @@ node_modules/
 .env
 .env.*
 
+# IDE settings
+.idea/
+
 # CI-built per-platform daemon binaries (published in the npm tarball, not in git)
 /binaries/

@@ -2,7 +2,10 @@
 //!
 //!   - `POST /chrome/mcp`   — the MCP Streamable HTTP endpoint;
 //!   - `GET  /chrome/ws`    — the browser extension's WebSocket;
-//!   - `GET  /chrome/status` — liveness and wiring probe.
+//!   - `GET  /chrome/status` — liveness and wiring probe;
+//!   - `POST /chrome/shutdown` — cooperative stop, so an upgraded `dsh web`
+//!     can retire a stale daemon it does not own (it has no PID for an orphan
+//!     left behind by an earlier session).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -15,8 +18,10 @@ use axum::routing::{get, post};
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use tokio::sync::Notify;
 use tokio::time::{interval, Duration};
 
+use crate::build_id;
 use crate::hub::{Hub, TOOL_TIMEOUT_MS};
 use crate::mcp;
 use crate::protocol::{parse_client_frame, ServerFrame};
@@ -31,18 +36,30 @@ const WS_MAX_MESSAGE: usize = 8 * 1024 * 1024;
 pub struct AppState {
     pub hub: Hub,
     pub started_at: Instant,
+    /// Notified by `/chrome/shutdown`; awaited by the graceful-shutdown future.
+    pub shutdown: Arc<Notify>,
 }
 
-/// Build the axum router with all three routes.
+/// Build the router, self-contained. Used by tests, where no one drives the
+/// shutdown signal.
+#[cfg(test)]
 pub fn router() -> Router {
+    router_with_shutdown(Arc::new(Notify::new()))
+}
+
+/// Build the router, sharing `shutdown` with the caller so a `/chrome/shutdown`
+/// request can stop the server.
+pub fn router_with_shutdown(shutdown: Arc<Notify>) -> Router {
     let state = AppState {
         hub: Hub::new(TOOL_TIMEOUT_MS),
         started_at: Instant::now(),
+        shutdown,
     };
     Router::new()
         .route("/chrome/mcp", post(mcp_handler))
         .route("/chrome/ws", get(ws_handler))
         .route("/chrome/status", get(status_handler))
+        .route("/chrome/shutdown", post(shutdown_handler))
         .with_state(state)
 }
 
@@ -78,12 +95,30 @@ async fn status_handler(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "name": mcp::SERVER_NAME,
         "version": mcp::server_version(),
+        // Content hash of this process's executable. dsh web compares it with
+        // the binary on disk to detect a daemon left over from an older build;
+        // the version string cannot, because releases do not bump Cargo.toml.
+        "build": build_id::build_hash(),
         "protocolVersion": mcp::PROTOCOL_VERSION,
         "running": true,
         "extension_connected": connected,
         "extension_version": version,
         "uptime_seconds": state.started_at.elapsed().as_secs()
     }))
+}
+
+/// Cooperative shutdown, so an upgraded `dsh web` can retire a stale daemon.
+///
+/// Guarded by the same origin check as the control socket: a web page cannot
+/// stop the daemon, while a local caller without an `Origin` header (dsh web,
+/// curl) may. The reply is sent before the server winds down.
+async fn shutdown_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !origin_allowed(&headers) {
+        return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+    }
+    tracing::info!("shutdown requested over HTTP");
+    state.shutdown.notify_waiters();
+    (StatusCode::ACCEPTED, "shutting down").into_response()
 }
 
 /// WebSocket upgrade handler for the extension.

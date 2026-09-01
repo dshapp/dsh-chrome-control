@@ -8,6 +8,10 @@
 //! survive its stdio pipes being closed when the parent goes away (SIGPIPE).
 
 mod build_id;
+mod host_exec;
+mod host_guard;
+mod host_routes;
+mod host_server_ops;
 mod hub;
 mod mcp;
 mod protocol;
@@ -38,9 +42,22 @@ async fn main() {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 
+    // The /host/* routes execute subprocesses, and their only caller check is
+    // an Origin header. That is defensible for a loopback listener, where the
+    // caller is already a local process that could run those commands itself;
+    // it is not defensible on a routable address. So the surface is withdrawn
+    // rather than served with a weaker guarantee than it appears to have.
+    let host_loopback = addr.ip().is_loopback();
+    if !host_loopback {
+        tracing::warn!(
+            %addr,
+            "not bound to loopback: /host/* is disabled (Chrome control is unaffected)"
+        );
+    }
+
     // Shared with the router so POST /chrome/shutdown can stop this server.
     let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-    let app = server::router_with_shutdown(shutdown.clone());
+    let app = server::router_with_options(shutdown.clone(), host_loopback);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .unwrap_or_else(|e| panic!("chrome-daemon: cannot bind {addr}: {e}"));

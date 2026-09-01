@@ -79,10 +79,83 @@ upgrades whose `Origin` is a `chrome-extension://` page (or none, for local
 probes); a web page that finds the endpoint cannot attach. Everything binds to
 whatever interface `dsh web` itself is configured for, and sends no telemetry.
 
+## Host operations (`/host/*`)
+
+Alongside the Chrome bridge, the daemon exposes a small REST surface the
+extension's settings UI uses for things an extension cannot do itself, because
+it cannot start a process:
+
+```
+POST /host/capabilities    { }
+POST /host/git             { cwd, args[] }
+POST /host/plugin          { action, name? }
+POST /host/server/version  { }
+POST /host/server/restart  { }
+POST /host/server/update   { }
+POST /host/disable         { }
+```
+
+These are **not** MCP and share no codec with `/chrome/mcp`; nothing here goes
+near the control WebSocket, since a second connection to `/chrome/ws` makes the
+hub fail the extension's in-flight calls and drop it for tens of seconds.
+
+Every route is a POST, including the capability probe, and that is load-bearing
+rather than stylistic: Chrome sends **no `Origin` header** on a simple `GET`
+from an extension page, so an Origin-only guard cannot authenticate one. An
+earlier revision exposed `GET /host/capabilities` and the side panel's own probe
+was refused, which made the whole Git tab report "this deployment does not offer
+host operations". `POST` with `application/json` is a preflighted request, so
+the header is always present. `GET` now answers 405 naming the right method.
+
+A non-zero subprocess exit is returned as HTTP 200 with an `exitCode`, because
+the UI needs git's own stderr rather than a generic 500.
+
+### dsh is resolved through pnpm, by shim path
+
+`/host/server/*` runs `$PNPM_HOME/dsh`, never whatever `dsh` is first on
+`PATH`, and never the path that shim resolves to. Both rules exist because of
+measured failure modes:
+
+- A machine can carry two installs (say an npm-global copy earlier on `PATH`
+  plus the pnpm one). Updating with pnpm while launching from `PATH` updates one
+  copy and keeps running the other, so the version never changes and the update
+  looks like it worked.
+- The pnpm shim `exec`s a content-addressed directory whose hash changes on
+  every reinstall. A resolved inner path is therefore valid only until the next
+  update — exactly when a restart tends to be requested.
+
+When dsh is not a pnpm install, these routes return 400 with
+`reason: "dsh-not-installed-via-pnpm"` rather than falling back.
+
+### The guard, and what it does not cover
+
+`/host/*` requires `Origin` to equal the one authorized extension exactly, and
+is served only when the daemon is bound to loopback. That stops web pages
+(browsers will not let a page forge an extension origin) and other extensions
+(compared with `==`, not `starts_with` — the `/chrome/*` helper's prefix policy
+would admit any extension and also allows a missing `Origin`, so it is
+deliberately not reused).
+
+It does **not** stop another local process running as the same user: such a
+process can set any `Origin`, and loopback TCP exposes no peer pid or uid. This
+is an accepted trade-off, on the grounds that the same process can already run
+`git` and `pnpm` directly. What limits it instead, and must not be relaxed:
+
+1. subcommand **and option** allowlists (`-c`, `--upload-pack` and friends are
+   refused, since they make git run arbitrary programs);
+2. registry-only package specs (`file:`, `link:`, `git+`, `github:` refused);
+3. the server operations taking no caller-supplied command, pid or package name
+   — restart proves the process on the port really is `dsh web` before
+   signalling it;
+4. `POST /host/disable`, which withdraws the whole surface until restart while
+   leaving `/chrome/*` untouched;
+5. refusing to serve `/host/*` at all when bound off the loopback.
+
 ## Tests
 
 ```bash
 pnpm run check   # typecheck + build + unit and end-to-end tests
+cd daemon && cargo test
 ```
 
 The end-to-end suite boots a real `webServer` on an ephemeral port, lets the

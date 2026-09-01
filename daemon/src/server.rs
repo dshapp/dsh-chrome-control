@@ -7,6 +7,7 @@
 //!     can retire a stale daemon it does not own (it has no PID for an orphan
 //!     left behind by an earlier session).
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -38,6 +39,15 @@ pub struct AppState {
     pub started_at: Instant,
     /// Notified by `/chrome/shutdown`; awaited by the graceful-shutdown future.
     pub shutdown: Arc<Notify>,
+    /// Set by `/host/disable`: the user's switch for the host-operation surface.
+    /// Only `/host/*` consults it, so Chrome control keeps working.
+    pub host_disabled: Arc<AtomicBool>,
+    /// False when the daemon is bound off the loopback, which disables
+    /// `/host/*` entirely — those routes run subprocesses, and no allowlist
+    /// makes that safe to expose to a network.
+    pub host_loopback: bool,
+    /// Serializes restart and update so two of either cannot interleave.
+    pub host_locks: crate::host_routes::HostLocks,
 }
 
 /// Build the router, self-contained. Used by tests, where no one drives the
@@ -47,19 +57,39 @@ pub fn router() -> Router {
     router_with_shutdown(Arc::new(Notify::new()))
 }
 
+/// A router whose listener is pretended to be off the loopback, so the
+/// `/host/*` refusal can be tested.
+#[cfg(test)]
+pub fn router_non_loopback() -> Router {
+    router_with_options(Arc::new(Notify::new()), false)
+}
+
 /// Build the router, sharing `shutdown` with the caller so a `/chrome/shutdown`
 /// request can stop the server.
 pub fn router_with_shutdown(shutdown: Arc<Notify>) -> Router {
+    router_with_options(shutdown, true)
+}
+
+/// Build the router, stating whether the listener is on the loopback.
+///
+/// `host_loopback` is threaded in from `main` rather than inferred here so the
+/// decision is made once, next to the address actually bound.
+pub fn router_with_options(shutdown: Arc<Notify>, host_loopback: bool) -> Router {
     let state = AppState {
         hub: Hub::new(TOOL_TIMEOUT_MS),
         started_at: Instant::now(),
         shutdown,
+        host_disabled: Arc::new(AtomicBool::new(false)),
+        host_loopback,
+        host_locks: crate::host_routes::HostLocks::default(),
     };
     Router::new()
         .route("/chrome/mcp", post(mcp_handler))
         .route("/chrome/ws", get(ws_handler))
         .route("/chrome/status", get(status_handler))
         .route("/chrome/shutdown", post(shutdown_handler))
+        // Host operations ride their own routes and their own stricter guard.
+        .merge(crate::host_routes::router())
         .with_state(state)
 }
 

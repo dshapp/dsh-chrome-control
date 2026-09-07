@@ -31,7 +31,7 @@ pub enum DispatchOutcome {
 
 /// Failure messages naming the concrete recovery step.
 const NOT_CONNECTED_MSG: &str = "No Chrome extension is attached. Ask the user to open Chrome, load the DSH Chrome Bridge extension at chrome://extensions (Developer mode -> Load unpacked), and make sure its popup toggle is enabled.";
-const TIMEOUT_MSG: &str = "The Chrome extension did not answer in time. The page may be busy or the tab may have been closed; retry with a narrower selector or a fresh navigate.";
+const TIMEOUT_MSG: &str = "The Chrome extension did not answer in time. If the page is busy or the tab was closed, retry with a narrower selector or a fresh navigate. If every call times out, the extension's service worker is likely wedged: check http://127.0.0.1:37086/chrome/status, then reload the extension at chrome://extensions.";
 const DISCONNECTED_MSG: &str = "The Chrome extension disconnected while this call was running. Ask the user to check that Chrome is still open, then retry.";
 
 impl DispatchOutcome {
@@ -59,6 +59,9 @@ struct HubInner {
     connected: bool,
     extension_version: String,
     next_id: u64,
+    /// Set when a ping went out and the matching pong has not come back yet.
+    /// A second unanswered ping means the peer is gone: see `ping_and_check`.
+    awaiting_pong: bool,
 }
 
 /// Routes tool calls to the one live extension socket and answers back.
@@ -83,11 +86,17 @@ impl Hub {
     }
 
     /// Attach a new socket, replacing and failing over any previous one.
+    ///
+    /// A live TCP socket is not a live extension: after Chrome recycles the MV3
+    /// service worker the old peer can vanish without a FIN reaching us, so the
+    /// socket lingers half-open. `connected` therefore stays false until the
+    /// peer proves itself with a `hello` frame (see `record_hello`); attaching
+    /// only makes the socket dispatchable.
     pub async fn attach(&self, outbound: Outbound) {
         let mut g = self.inner.lock().await;
         let previous = g.outbound.take();
         g.outbound = Some(outbound.clone());
-        g.connected = true;
+        g.awaiting_pong = false;
         if previous.is_some() {
             fail_all(&mut g);
         }
@@ -116,6 +125,7 @@ impl Hub {
         g.outbound = None;
         g.connected = false;
         g.extension_version.clear();
+        g.awaiting_pong = false;
         fail_all(&mut g);
     }
 
@@ -130,12 +140,29 @@ impl Hub {
         }
     }
 
-    /// Ask the live socket to send a liveness probe.
-    pub async fn ping(&self) {
-        let g = self.inner.lock().await;
-        if let Some(outbound) = &g.outbound {
-            outbound(&ServerFrame::Ping);
+    /// Record the extension's answer to a liveness probe.
+    pub async fn record_pong(&self) {
+        self.inner.lock().await.awaiting_pong = false;
+    }
+
+    /// Send a liveness probe, and report whether the peer missed the previous
+    /// one. Returns true when the socket is dead and must be torn down.
+    ///
+    /// This is the only way a half-open socket is ever discovered. Writing to
+    /// one succeeds at the kernel level, so a dispatch to a dead peer hangs
+    /// until its own timeout instead of failing fast; without this probe the
+    /// hub would keep reporting a peer that can never answer.
+    pub async fn ping_and_check(&self) -> bool {
+        let mut g = self.inner.lock().await;
+        let Some(outbound) = g.outbound.clone() else {
+            return false;
+        };
+        if g.awaiting_pong {
+            return true;
         }
+        g.awaiting_pong = true;
+        drop(g);
+        !outbound(&ServerFrame::Ping)
     }
 
     /// Send one tool call to the extension and await its answer.
@@ -202,6 +229,56 @@ mod tests {
 
     fn outbound_failing() -> Outbound {
         Arc::new(|_frame: &ServerFrame| false)
+    }
+
+    /// The regression this whole mechanism exists for: a socket that attached
+    /// but never said hello is not a connected extension.
+    #[tokio::test]
+    async fn attach_alone_does_not_report_connected() {
+        let hub = Hub::new(TOOL_TIMEOUT_MS);
+        let (outbound, _log) = outbound_sink();
+        hub.attach(outbound).await;
+        let (connected, version) = hub.extension_state().await;
+        assert!(!connected, "a socket without a hello must not count as connected");
+        assert_eq!(version, "");
+    }
+
+    #[tokio::test]
+    async fn hello_is_what_marks_it_connected() {
+        let hub = Hub::new(TOOL_TIMEOUT_MS);
+        let (outbound, _log) = outbound_sink();
+        hub.attach(outbound).await;
+        hub.record_hello("0.3.1".into()).await;
+        let (connected, version) = hub.extension_state().await;
+        assert!(connected);
+        assert_eq!(version, "0.3.1");
+    }
+
+    /// Two probes with no pong in between mean the peer is gone, even though
+    /// the socket still accepts writes.
+    #[tokio::test]
+    async fn a_missed_pong_reports_the_peer_dead() {
+        let hub = Hub::new(TOOL_TIMEOUT_MS);
+        let (outbound, _log) = outbound_sink();
+        hub.attach(outbound).await;
+        assert!(!hub.ping_and_check().await, "first probe just goes out");
+        assert!(hub.ping_and_check().await, "second unanswered probe is fatal");
+    }
+
+    #[tokio::test]
+    async fn a_pong_keeps_the_peer_alive() {
+        let hub = Hub::new(TOOL_TIMEOUT_MS);
+        let (outbound, _log) = outbound_sink();
+        hub.attach(outbound).await;
+        assert!(!hub.ping_and_check().await);
+        hub.record_pong().await;
+        assert!(!hub.ping_and_check().await, "an answered probe clears the strike");
+    }
+
+    #[tokio::test]
+    async fn ping_on_an_empty_hub_is_not_a_death() {
+        let hub = Hub::new(TOOL_TIMEOUT_MS);
+        assert!(!hub.ping_and_check().await);
     }
 
     #[tokio::test]

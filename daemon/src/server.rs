@@ -186,6 +186,9 @@ async fn serve_extension(socket: WebSocket, state: AppState) {
     tracing::info!("chrome extension connected");
 
     let hub = state.hub.clone();
+    // Signals that the liveness probe gave up on this peer.
+    let (dead_tx, dead_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut pinger_dead = dead_rx;
     let pinger = tokio::spawn({
         let hub = hub.clone();
         async move {
@@ -193,14 +196,27 @@ async fn serve_extension(socket: WebSocket, state: AppState) {
             tick.tick().await; // first immediate
             loop {
                 tick.tick().await;
-                hub.ping().await;
+                // A missed pong means the peer is gone even though the socket
+                // still looks writable. Stop probing and let the caller tear
+                // the connection down.
+                if hub.ping_and_check().await {
+                    tracing::warn!("chrome extension missed a liveness probe; dropping the socket");
+                    let _ = dead_tx.send(());
+                    break;
+                }
             }
         }
     });
 
-    // Drive incoming messages.
+    // Drive incoming messages until the peer closes or the pinger declares it
+    // dead. Racing the two is what makes a half-open socket recoverable: the
+    // read half of such a socket simply never wakes up.
     loop {
-        match stream.next().await {
+        let msg = tokio::select! {
+            m = stream.next() => m,
+            _ = &mut pinger_dead => None,
+        };
+        match msg {
             Some(Ok(msg)) => {
                 if let Message::Text(text) = msg {
                     if let Some(frame) = parse_client_frame(text.as_str()) {
@@ -210,7 +226,9 @@ async fn serve_extension(socket: WebSocket, state: AppState) {
                                 hub.record_hello(extension_version).await;
                                 let _ = outbound(&ServerFrame::HelloAck);
                             }
-                            crate::protocol::ClientFrame::Pong => {}
+                            crate::protocol::ClientFrame::Pong => {
+                                hub.record_pong().await;
+                            }
                             crate::protocol::ClientFrame::ToolResult { response_to_request_id, data, error } => {
                                 let outcome = match error {
                                     Some(e) => crate::hub::DispatchOutcome::Error(e),

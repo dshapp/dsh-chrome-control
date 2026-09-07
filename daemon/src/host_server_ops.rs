@@ -300,6 +300,40 @@ pub fn web_log_path() -> PathBuf {
     home.join(".dsh-chrome/logs/dsh-web.log")
 }
 
+/// Ask process `pid` to exit, letting it run its shutdown path.
+///
+/// `libc` is a `cfg(unix)` dependency, so its signal calls cannot appear in
+/// code compiled for Windows. Both platforms make a best-effort request: there
+/// is no reply to check, and the caller settles the peer's fate by polling the
+/// port rather than by trusting this call.
+#[cfg(unix)]
+pub fn terminate(pid: u32) {
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+}
+
+/// Force process `pid` to exit immediately.
+#[cfg(unix)]
+pub fn kill(pid: u32) {
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+/// Windows has no signals; `taskkill` without `/F` asks a process to close.
+#[cfg(windows)]
+pub fn terminate(pid: u32) {
+    let _ = std::process::Command::new("taskkill").args(["/PID", &pid.to_string()]).output();
+}
+
+/// `/F` is the Windows counterpart to SIGKILL, and `/T` takes the child tree
+/// with it, matching how a spawned server is torn down on Unix.
+#[cfg(windows)]
+pub fn kill(pid: u32) {
+    let _ = std::process::Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
+}
+
 /// Budgets, exposed so the route can report them and tests can assert them.
 pub fn stop_budget() -> Duration {
     STOP_BUDGET

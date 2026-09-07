@@ -289,14 +289,12 @@ async fn server_restart(State(state): State<AppState>, headers: HeaderMap) -> Re
     };
 
     // Ask first, insist second: SIGTERM lets the server close its sessions.
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGTERM);
-    }
+    // `libc` is a Unix-only dependency, so the signals go through a platform
+    // shim rather than being called directly.
+    ops::terminate(pid);
     let mut stopped = ops::wait_for_port(port, false, ops::stop_budget()).await;
     if !stopped {
-        unsafe {
-            libc::kill(pid as libc::pid_t, libc::SIGKILL);
-        }
+        ops::kill(pid);
         stopped = ops::wait_for_port(port, false, std::time::Duration::from_secs(3)).await;
     }
 

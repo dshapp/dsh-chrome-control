@@ -1,6 +1,6 @@
 {
   "name": "dsh-chrome-control",
-  "version": "0.3.0",
+  "version": "0.3.3",
   "description": "DeepSeek Harness (DSH) bundle: spawns the Rust chrome-daemon process exposing the user's real Chrome to the agent as mcp__chrome__* tools.",
   "type": "module",
   "license": "MIT",

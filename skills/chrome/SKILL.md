@@ -61,7 +61,7 @@ Use `upload` for a file input or its visible upload trigger; never use `fill` an
 
 ## Dropdowns and focus
 
-`fill` cannot drive a dropdown. Use `select` instead — for a native `<select>` **and** for any custom dropdown following the ARIA combobox pattern (`role="combobox"` or `aria-haspopup`), which covers the popular component libraries because they implement the standard. It matches the option's `value` first, then its exact visible text, then a substring, so both `"CA"` and `"California"` can work. When nothing matches, the error lists the visible options — read it rather than guessing again. A custom dropdown is driven with trusted input, so it activates the tab. `select` echoes `verified`; component libraries that render the chosen value outside the combobox (multi-select tags, for example) can report `verified: false` even when selection landed, so re-read with `snapshot({ diff: true })` before concluding it failed.
+`fill` cannot drive a dropdown. Use `select` instead — for a native `<select>` **and** for any custom dropdown following the ARIA combobox pattern (`role="combobox"` or `aria-haspopup`), which covers the popular component libraries because they implement the standard. It matches the option's `value` first, then its exact visible text, then a substring, so both `"CA"` and `"California"` can work. When nothing matches, the error lists the visible options — read it rather than guessing again. A custom dropdown is driven with trusted input, which runs on a background tab. `select` echoes `verified`; component libraries that render the chosen value outside the combobox (multi-select tags, for example) can report `verified: false` even when selection landed, so re-read with `snapshot({ diff: true })` before concluding it failed.
 
 A control that ignores ARIA gets an error naming the fallback: `click` with `trusted: true`. Multi-level pickers (cascaders, nested menus) are not `select`'s job — walk them level by level with trusted clicks, re-reading the open pane between clicks.
 
@@ -95,11 +95,15 @@ Requests are only recorded from the moment the tools attached to that tab, so a 
 
 Prefer clicking the submit button with `click`. When there is no button, use `send_keys` with `Enter`. `send_keys` also takes chords such as `Control+A` or a bare `Escape` to dismiss a modal.
 
-Modifier names are passed through literally, and keyboard shortcuts are not portable: select-all is `Meta+A` on macOS and `Control+A` on Windows and Linux. `snapshot` reports the operating system as `platform` (`mac`, `win`, `linux`, or `null` when unknown) — read it before sending a chord, because a chord aimed at the wrong modifier is delivered without doing anything and looks just like a call that worked.
+Modifier names are passed through literally, and keyboard shortcuts are not portable: select-all is `Meta+A` on macOS and `Control+A` on Windows and Linux. `snapshot` reports the operating system as `platform` (`mac`, `win`, `linux`, or `null` when unknown) — read it before sending a chord a *page* implements itself. The standard editing chords above are normalised for you, so `Meta+A` and `Control+A` both select all.
 
 Pass `count` to repeat a key in one call (`{ keys: "Backspace", count: 40 }`, capped at 200) instead of making one call per press. `send_keys` reports `changed` — whether the focused text actually differs afterwards. `changed: false` on an editing key means the keystroke never landed, so check focus and the modifier rather than pressing it again; navigation and submit keys legitimately report `false`.
 
-To **clear** a field, use `fill` with an empty string — it sets the value directly and is the reliable way. A select-all chord is not a substitute: in a native `<input>` or `<textarea>` select-all is a browser editing command rather than a key a page listens for, and `send_keys` delivers the keystroke without invoking that command, so nothing is selected on any platform. A chord does work where the page implements the shortcut in JavaScript itself, which is why the modifier still has to match the platform.
+Editing chords work: **select-all, copy, cut, paste, undo/redo, Enter-to-submit and Delete** are dispatched with the editing command the platform requires, in native `<input>`/`<textarea>` and in `contenteditable` alike. So select-all-then-type replaces a field's contents, and copy in one field then paste in another moves text between them.
+
+The result gives you evidence rather than a bare success: `selectionChanged` plus the `events` actually observed (`copy`, `cut`, `paste`, `submit`, `beforeinput`). That matters because a successful select-all changes no text, so `changed: false` alone cannot tell it apart from a keystroke that did nothing. When a known editing chord does turn out to be completely inert, the result carries a `hint` naming what to check — usually that the intended field never had focus.
+
+To **clear** a field, `fill` with an empty string is still the most direct route; select-all followed by typing now works too.
 
 `key_type` reports `verified` the way `fill` does, by reading the page back. `verified: false` means the page holds something other than what was sent. Read the returned `value` to see what it actually kept, then change approach rather than typing the same text again.
 
@@ -111,7 +115,9 @@ To **clear** a field, use `fill` with an empty string — it sets the value dire
 2. `mouse_click` with a `selector` — same trusted click; use it when you also want the button/clickCount options.
 3. `mouse_click` with raw `x`/`y` — last resort; coordinates are far more brittle than `@e` refs.
 
-Also trusted: `hover` (menus and tooltips that only open on hover), `key_type` (type into whatever is focused), `send_keys` (press one key or chord, optionally repeated with `count`). All trusted input activates the tab.
+Also trusted: `hover` (menus and tooltips that only open on hover), `key_type` (type into whatever is focused), `send_keys` (press one key or chord, optionally repeated with `count`). All of these run on a background tab: none of them brings the tab to the foreground, so they never disturb the tab the user is working in.
+
+`send_keys` refuses a browser-level chord (`Cmd/Ctrl+T`, `+W`, `+L`, `+R`, `Ctrl+Tab` and friends). Chrome consumes those before the page sees them and CDP input enters at the renderer, so they could never be delivered; the error names the tool to use instead (`navigate`, `close_tab`).
 
 A trusted click refuses rather than guessing when the target is not safely clickable: `disabled`, `hidden`, `zero-size`, `outside-viewport`, `pointer-events`, `obscured`, or `stale`. The error names the reason and the element actually under that point (`hit target: ...`), so treat it as real page state — scroll, dismiss the overlay, or wait for the control to become enabled — not as a tool glitch. It never falls back to blind coordinates.
 
@@ -134,7 +140,8 @@ To act on a page the user is already looking at ("the invoice I have open"), cal
 ## Known limits
 
 - **Cross-origin iframes**: tools act on the top frame. If the target lives in an iframe from another origin, navigate directly to the iframe's URL.
-- **Trusted input activates the tab.** `hover`, `mouse_click`, `key_type`, and `send_keys` bring their tab to the foreground, because Chrome only delivers real input to a focused tab. The DOM-level tools work fine on a hidden tab.
+- **Keyboard input needs a focused element, not a focused tab.** Trusted input reaches a background tab, but `key_type` and `send_keys` land wherever the *page's* focus points. After `navigate`, that is `<body>` — click or `focus` the field first, or the keystrokes go nowhere useful.
+- **Browser-level chords cannot be sent.** See `send_keys` above; this is a Chrome architecture limit, not a policy.
 - **Network history starts at attach.** `network` cannot show requests made before the tools attached to that tab.
 - **A debugging banner is normal.** Chrome shows a "being debugged" notice while these tools are attached, and DevTools cannot be open on the same tab at the same time. This is how the bridge works, not a fault — mention it if the user is surprised.
 

@@ -95,7 +95,7 @@ pub static TOOLS: LazyLock<Vec<ToolSpec>> = LazyLock::new(|| vec![
         description: "Click an element with a full synthetic pointer stroke (pointerdown through click). Prefer an @e ref from snapshot over a hand-written CSS selector. If a widget ignores the synthetic stroke, retry with trusted:true for real browser input.",
         input_schema: with_session(json!({
             "selector": { "type": "string", "description": "An @e ref from snapshot (preferred) or a CSS selector." },
-            "trusted": { "type": "boolean", "description": "Dispatch real (trusted) input at the element's center instead of synthetic events. Works on widgets that check isTrusted or listen outside the DOM event path; costs a tab activation." }
+            "trusted": { "type": "boolean", "description": "Dispatch real (trusted) input at the element's center instead of synthetic events. Works on widgets that check isTrusted or listen outside the DOM event path. Runs on a background tab without bringing it to the foreground." }
         }), &["selector"]),
     },
     ToolSpec {
@@ -143,7 +143,7 @@ pub static TOOLS: LazyLock<Vec<ToolSpec>> = LazyLock::new(|| vec![
     },
     ToolSpec {
         name: "mouse_click",
-        description: "Click with a real (trusted) mouse event, at an element's center (selector) or at viewport coordinates. Use when a page ignores synthetic clicks because it checks event.isTrusted. Pass either selector, or both x and y. Activates the tab.",
+        description: "Click with a real (trusted) mouse event, at an element's center (selector) or at viewport coordinates. Use when a page ignores synthetic clicks because it checks event.isTrusted. Pass either selector, or both x and y. Runs on a background tab without stealing the foreground, and reports received:false when the press never reached the page.",
         input_schema: with_session(json!({
             "selector": { "type": "string", "description": "An @e ref from snapshot (preferred) or a CSS selector; it is scrolled into view and its center is clicked." },
             "x": { "type": "number", "description": "Viewport x coordinate in CSS pixels; requires y and no selector." },
@@ -161,15 +161,16 @@ pub static TOOLS: LazyLock<Vec<ToolSpec>> = LazyLock::new(|| vec![
     },
     ToolSpec {
         name: "send_keys",
-        description: "Press one key or chord with real (trusted) key events, e.g. Enter, Escape, Tab, or Control+A. Use this to submit a form when clicking a button is not possible. Pass count to repeat the key in a single call instead of one call per press. The result reports changed:true/false so a key the page never applied is visible immediately. Modifier names are passed through literally and shortcuts differ by operating system, so match the modifier to the platform snapshot reports. Note that a chord only reaches a page that implements the shortcut itself: in a native input or textarea, editing shortcuts such as select-all are browser commands rather than page keybindings and are not performed here, so clear a field with fill instead.",
+        description: "Press one key or chord with real (trusted) key events, e.g. Enter, Escape, Tab, or Control+A. Use this to submit a form when clicking a button is not possible. Pass count to repeat the key in a single call instead of one call per press. The result reports changed:true/false so a key the page never applied is visible immediately. Modifier names are passed through literally and shortcuts differ by operating system, so match the modifier to the platform snapshot reports. Editing chords work: select-all, copy, cut, paste, undo/redo, Enter-to-submit and Delete are dispatched with the editing command the platform needs, in native inputs, textareas and contenteditable alike. The result reports selectionChanged plus the clipboard/submit events observed, so a select-all (which changes no text) is distinguishable from a keystroke that did nothing; when a known editing chord turns out inert, hint says what to check. A browser-level chord (Cmd/Ctrl+T, +W, +L, +R and friends) is refused outright, because Chrome consumes it before the renderer sees it and CDP input enters at the renderer — use navigate or close_tab for those.",
         input_schema: with_session(json!({
             "keys": { "type": "string", "description": "A key name or chord such as \"Enter\", \"Escape\", or \"Control+A\". Modifier names are taken literally; shortcuts differ by operating system, so check the platform reported by snapshot." },
-            "count": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Times to repeat the key in this call; defaults to 1, capped at 200." }
+            "count": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Times to repeat the key in this call; defaults to 1, capped at 200." },
+            "commands": { "type": "array", "items": { "type": "string" }, "description": "Advanced, rarely needed: explicit macOS editing commands to perform instead of the ones derived from the chord, such as moveToBeginningOfLine. Standard editing chords already work without this." }
         }), &["keys"]),
     },
     ToolSpec {
         name: "hover",
-        description: "Move the real mouse pointer over an element or viewport point, firing trusted mouseover/mouseenter. Use for menus and tooltips that only appear on hover. Pass either selector, or both x and y — not both forms. Activates the tab, because trusted input only reaches the focused tab.",
+        description: "Move the real mouse pointer over an element or viewport point, firing trusted mouseover/mouseenter. Use for menus and tooltips that only appear on hover. Pass either selector, or both x and y — not both forms. Runs on a background tab without stealing the foreground.",
         input_schema: with_session(json!({
             "selector": { "type": "string", "description": "An @e ref from snapshot (preferred) or a CSS selector; its center is used." },
             "x": { "type": "number", "description": "Viewport x coordinate in CSS pixels; requires y and no selector." },

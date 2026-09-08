@@ -82,7 +82,7 @@ pub static TOOLS: LazyLock<Vec<ToolSpec>> = LazyLock::new(|| vec![
     },
     ToolSpec {
         name: "snapshot",
-        description: "Read the current page as an indented accessibility outline with @e refs, one element per line. Use it to locate elements for click/fill. Defaults to interactive elements plus headings and table cells; pass mode:\"full\" for every node or mode:\"text\" for prose. To read an article, prefer get_text.",
+        description: "Read the current page as an indented accessibility outline with @e refs, one element per line. Use it to locate elements for click/fill. Defaults to interactive elements plus headings and table cells; pass mode:\"full\" for every node or mode:\"text\" for prose. To read an article, prefer get_text. The result also reports platform, the operating system Chrome is running on (\"mac\", \"win\", \"linux\", or null when unknown), so keyboard shortcuts can be aimed at the right modifier — select-all is Meta+A on mac and Control+A elsewhere.",
         input_schema: with_session(json!({
             "mode": { "type": "string", "enum": ["interactive", "full", "text"], "description": "interactive (default) keeps controls plus headings/cells/images; full keeps every node; text keeps prose and drops refs." },
             "maxDepth": { "type": "integer", "minimum": 0, "description": "Drop elements nested deeper than this. Omit for no limit." },
@@ -154,16 +154,17 @@ pub static TOOLS: LazyLock<Vec<ToolSpec>> = LazyLock::new(|| vec![
     },
     ToolSpec {
         name: "key_type",
-        description: "Type text into the focused element with real (trusted) key events, character by character.",
+        description: "Type text into the focused element with real (trusted) key events. The result reports verified:true/false by reading the page back, so text the page rejected or rewrote is visible on the first call instead of looking like a success. When verified is false, read the returned value to see what the page actually holds and change approach rather than typing it again.",
         input_schema: with_session(json!({
             "text": { "type": "string", "description": "Text to type into the currently focused element." }
         }), &["text"]),
     },
     ToolSpec {
         name: "send_keys",
-        description: "Press one key or chord with real (trusted) key events, e.g. Enter, Escape, Tab, or Control+A. Use this to submit a form when clicking a button is not possible.",
+        description: "Press one key or chord with real (trusted) key events, e.g. Enter, Escape, Tab, or Control+A. Use this to submit a form when clicking a button is not possible. Pass count to repeat the key in a single call instead of one call per press. The result reports changed:true/false so a key the page never applied is visible immediately. Modifier names are passed through literally and shortcuts differ by operating system, so match the modifier to the platform snapshot reports. Note that a chord only reaches a page that implements the shortcut itself: in a native input or textarea, editing shortcuts such as select-all are browser commands rather than page keybindings and are not performed here, so clear a field with fill instead.",
         input_schema: with_session(json!({
-            "keys": { "type": "string", "description": "A key name or chord such as \"Enter\", \"Escape\", or \"Control+A\"." }
+            "keys": { "type": "string", "description": "A key name or chord such as \"Enter\", \"Escape\", or \"Control+A\". Modifier names are taken literally; shortcuts differ by operating system, so check the platform reported by snapshot." },
+            "count": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Times to repeat the key in this call; defaults to 1, capped at 200." }
         }), &["keys"]),
     },
     ToolSpec {
@@ -294,6 +295,38 @@ mod tests {
     #[test]
     fn advertises_27_tools() {
         assert_eq!(TOOLS.len(), 27, "catalog must list 27 tools");
+    }
+
+    #[test]
+    fn snapshot_reports_platform() {
+        let spec = TOOLS.iter().find(|t| t.name == "snapshot").expect("snapshot is advertised");
+        // Callers only know to read the field if the contract names it.
+        assert!(spec.description.contains("platform"));
+    }
+
+    #[test]
+    fn send_keys_does_not_presume_an_operating_system() {
+        let spec = TOOLS.iter().find(|t| t.name == "send_keys").expect("send_keys is advertised");
+        // Modifier names are passed through literally, so the description must
+        // point at the reported platform instead of hardcoding one platform's
+        // shortcut as the advice.
+        assert!(spec.description.contains("platform"));
+        assert!(
+            !spec.description.contains("Meta+A on macOS"),
+            "send_keys must not prescribe one platform's shortcut",
+        );
+    }
+
+    #[test]
+    fn send_keys_accepts_a_bounded_repeat_count() {
+        let spec = TOOLS.iter().find(|t| t.name == "send_keys").expect("send_keys is advertised");
+        let count = &spec.input_schema["properties"]["count"];
+        assert_eq!(count["type"], "integer");
+        assert_eq!(count["minimum"], 1);
+        // Must match SEND_KEYS_MAX_COUNT in the extension.
+        assert_eq!(count["maximum"], 200);
+        let required = spec.input_schema["required"].as_array().unwrap();
+        assert!(!required.iter().any(|v| v == "count"), "count must be optional");
     }
 
     #[test]

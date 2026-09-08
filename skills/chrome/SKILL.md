@@ -95,6 +95,14 @@ Requests are only recorded from the moment the tools attached to that tab, so a 
 
 Prefer clicking the submit button with `click`. When there is no button, use `send_keys` with `Enter`. `send_keys` also takes chords such as `Control+A` or a bare `Escape` to dismiss a modal.
 
+Modifier names are passed through literally, and keyboard shortcuts are not portable: select-all is `Meta+A` on macOS and `Control+A` on Windows and Linux. `snapshot` reports the operating system as `platform` (`mac`, `win`, `linux`, or `null` when unknown) — read it before sending a chord, because a chord aimed at the wrong modifier is delivered without doing anything and looks just like a call that worked.
+
+Pass `count` to repeat a key in one call (`{ keys: "Backspace", count: 40 }`, capped at 200) instead of making one call per press. `send_keys` reports `changed` — whether the focused text actually differs afterwards. `changed: false` on an editing key means the keystroke never landed, so check focus and the modifier rather than pressing it again; navigation and submit keys legitimately report `false`.
+
+To **clear** a field, use `fill` with an empty string — it sets the value directly and is the reliable way. A select-all chord is not a substitute: in a native `<input>` or `<textarea>` select-all is a browser editing command rather than a key a page listens for, and `send_keys` delivers the keystroke without invoking that command, so nothing is selected on any platform. A chord does work where the page implements the shortcut in JavaScript itself, which is why the modifier still has to match the platform.
+
+`key_type` reports `verified` the way `fill` does, by reading the page back. `verified: false` means the page holds something other than what was sent. Read the returned `value` to see what it actually kept, then change approach rather than typing the same text again.
+
 ## When a page ignores clicks
 
 `click` dispatches the full synthetic pointer stroke (pointerdown → mousedown → pointerup → mouseup → click), which most widgets accept. Some pages (banking portals, captchas, widgets that check `event.isTrusted` or listen outside the DOM event path) still ignore it. Escalate in this order:
@@ -103,7 +111,7 @@ Prefer clicking the submit button with `click`. When there is no button, use `se
 2. `mouse_click` with a `selector` — same trusted click; use it when you also want the button/clickCount options.
 3. `mouse_click` with raw `x`/`y` — last resort; coordinates are far more brittle than `@e` refs.
 
-Also trusted: `hover` (menus and tooltips that only open on hover), `key_type` (type into whatever is focused), `send_keys` (press one key or chord). All trusted input activates the tab.
+Also trusted: `hover` (menus and tooltips that only open on hover), `key_type` (type into whatever is focused), `send_keys` (press one key or chord, optionally repeated with `count`). All trusted input activates the tab.
 
 A trusted click refuses rather than guessing when the target is not safely clickable: `disabled`, `hidden`, `zero-size`, `outside-viewport`, `pointer-events`, `obscured`, or `stale`. The error names the reason and the element actually under that point (`hit target: ...`), so treat it as real page state — scroll, dismiss the overlay, or wait for the control to become enabled — not as a tool glitch. It never falls back to blind coordinates.
 

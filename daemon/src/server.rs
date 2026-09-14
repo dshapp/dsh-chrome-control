@@ -7,7 +7,7 @@
 //!     can retire a stale daemon it does not own (it has no PID for an orphan
 //!     left behind by an earlier session).
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -186,25 +186,46 @@ async fn serve_extension(socket: WebSocket, state: AppState) {
     tracing::info!("chrome extension connected");
 
     let hub = state.hub.clone();
+    // Set when a ping went out on *this* socket and its pong has not come back.
+    //
+    // Per connection, deliberately. While this lived on the hub, every socket's
+    // pinger probed whichever socket the hub currently held: a superseded one
+    // could never discover its own dead peer, and two pingers racing the one
+    // flag would condemn a healthy socket whose pong was merely slow.
+    let awaiting_pong = Arc::new(AtomicBool::new(false));
     // Signals that the liveness probe gave up on this peer.
     let (dead_tx, dead_rx) = tokio::sync::oneshot::channel::<()>();
     let mut pinger_dead = dead_rx;
     let pinger = tokio::spawn({
         let hub = hub.clone();
+        let outbound = outbound.clone();
+        let awaiting_pong = awaiting_pong.clone();
         async move {
             let mut tick = interval(Duration::from_millis(PING_INTERVAL_MS));
             tick.tick().await; // first immediate
             loop {
                 tick.tick().await;
+                // Superseded: a newer socket owns the extension now, and this
+                // one's peer will never be spoken to again. Nothing about its
+                // TCP connection says so, so it is asked rather than awaited.
+                if !hub.is_live(&outbound).await {
+                    tracing::info!("chrome extension socket superseded; dropping it");
+                    break;
+                }
                 // A missed pong means the peer is gone even though the socket
                 // still looks writable. Stop probing and let the caller tear
                 // the connection down.
-                if hub.ping_and_check().await {
+                if awaiting_pong.swap(true, Ordering::SeqCst) {
                     tracing::warn!("chrome extension missed a liveness probe; dropping the socket");
-                    let _ = dead_tx.send(());
+                    break;
+                }
+                if !outbound(&ServerFrame::Ping) {
                     break;
                 }
             }
+            // The loop only ends when this socket has to go, so one signal here
+            // covers every exit.
+            let _ = dead_tx.send(());
         }
     });
 
@@ -227,7 +248,7 @@ async fn serve_extension(socket: WebSocket, state: AppState) {
                                 let _ = outbound(&ServerFrame::HelloAck);
                             }
                             crate::protocol::ClientFrame::Pong => {
-                                hub.record_pong().await;
+                                awaiting_pong.store(false, Ordering::SeqCst);
                             }
                             crate::protocol::ClientFrame::ToolResult { response_to_request_id, data, error } => {
                                 let outcome = match error {
@@ -249,8 +270,14 @@ async fn serve_extension(socket: WebSocket, state: AppState) {
     pinger.abort();
     hub.detach(&outbound).await;
     tracing::info!("chrome extension disconnected");
-    let _ = writer.await;
-    let _ = tx; // keep the sender alive until the writer drains
+    // The writer task owns the sink half of this socket, so the socket is only
+    // released once that task is gone. It must be aborted, never awaited: it
+    // ends when every sender is dropped, and `tx` and `outbound` are still in
+    // scope right here — awaiting it parks this function forever, leaving the
+    // connection in CLOSE_WAIT. That hang leaked one file descriptor per
+    // reconnect until the daemon could no longer serve a WebSocket at all,
+    // while its HTTP routes went on answering normally.
+    writer.abort();
 }
 
 #[cfg(test)]

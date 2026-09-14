@@ -59,9 +59,6 @@ struct HubInner {
     connected: bool,
     extension_version: String,
     next_id: u64,
-    /// Set when a ping went out and the matching pong has not come back yet.
-    /// A second unanswered ping means the peer is gone: see `ping_and_check`.
-    awaiting_pong: bool,
 }
 
 /// Routes tool calls to the one live extension socket and answers back.
@@ -92,11 +89,18 @@ impl Hub {
     /// socket lingers half-open. `connected` therefore stays false until the
     /// peer proves itself with a `hello` frame (see `record_hello`); attaching
     /// only makes the socket dispatchable.
+    ///
+    /// The superseded socket is not this method's to close — the task serving it
+    /// notices through `is_live` and tears itself down.
     pub async fn attach(&self, outbound: Outbound) {
         let mut g = self.inner.lock().await;
         let previous = g.outbound.take();
         g.outbound = Some(outbound.clone());
-        g.awaiting_pong = false;
+        // The new peer has not proved itself yet, and the old one's hello says
+        // nothing about this socket. Without this reset a superseded connection
+        // would leave `connected: true` standing over a socket nobody answered on.
+        g.connected = false;
+        g.extension_version.clear();
         if previous.is_some() {
             fail_all(&mut g);
         }
@@ -125,7 +129,6 @@ impl Hub {
         g.outbound = None;
         g.connected = false;
         g.extension_version.clear();
-        g.awaiting_pong = false;
         fail_all(&mut g);
     }
 
@@ -140,29 +143,18 @@ impl Hub {
         }
     }
 
-    /// Record the extension's answer to a liveness probe.
-    pub async fn record_pong(&self) {
-        self.inner.lock().await.awaiting_pong = false;
-    }
-
-    /// Send a liveness probe, and report whether the peer missed the previous
-    /// one. Returns true when the socket is dead and must be torn down.
+    /// Whether `outbound` is still the socket the hub dispatches to.
     ///
-    /// This is the only way a half-open socket is ever discovered. Writing to
-    /// one succeeds at the kernel level, so a dispatch to a dead peer hangs
-    /// until its own timeout instead of failing fast; without this probe the
-    /// hub would keep reporting a peer that can never answer.
-    pub async fn ping_and_check(&self) -> bool {
-        let mut g = self.inner.lock().await;
-        let Some(outbound) = g.outbound.clone() else {
-            return false;
-        };
-        if g.awaiting_pong {
-            return true;
-        }
-        g.awaiting_pong = true;
-        drop(g);
-        !outbound(&ServerFrame::Ping)
+    /// A connection that has been superseded stops being anyone's peer the
+    /// moment a newer one attaches, but nothing about its TCP socket changes —
+    /// so the task serving it asks here instead of waiting for a FIN that may
+    /// never arrive.
+    pub async fn is_live(&self, outbound: &Outbound) -> bool {
+        let g = self.inner.lock().await;
+        g.outbound
+            .as_ref()
+            .map(|live| ptr_eq(live.as_ref(), outbound.as_ref()))
+            .unwrap_or(false)
     }
 
     /// Send one tool call to the extension and await its answer.
@@ -254,31 +246,40 @@ mod tests {
         assert_eq!(version, "0.3.1");
     }
 
-    /// Two probes with no pong in between mean the peer is gone, even though
-    /// the socket still accepts writes.
+    /// The regression behind the fd leak: a superseded socket used to have no
+    /// way to learn it had been replaced, so its task lived forever.
     #[tokio::test]
-    async fn a_missed_pong_reports_the_peer_dead() {
+    async fn a_superseded_socket_is_not_live() {
         let hub = Hub::new(TOOL_TIMEOUT_MS);
-        let (outbound, _log) = outbound_sink();
-        hub.attach(outbound).await;
-        assert!(!hub.ping_and_check().await, "first probe just goes out");
-        assert!(hub.ping_and_check().await, "second unanswered probe is fatal");
+        let (first, _l1) = outbound_sink();
+        let (second, _l2) = outbound_sink();
+        hub.attach(first.clone()).await;
+        assert!(hub.is_live(&first).await);
+        hub.attach(second.clone()).await;
+        assert!(!hub.is_live(&first).await, "the older socket must read as superseded");
+        assert!(hub.is_live(&second).await);
     }
 
     #[tokio::test]
-    async fn a_pong_keeps_the_peer_alive() {
+    async fn nothing_is_live_on_an_empty_hub() {
         let hub = Hub::new(TOOL_TIMEOUT_MS);
         let (outbound, _log) = outbound_sink();
-        hub.attach(outbound).await;
-        assert!(!hub.ping_and_check().await);
-        hub.record_pong().await;
-        assert!(!hub.ping_and_check().await, "an answered probe clears the strike");
+        assert!(!hub.is_live(&outbound).await);
     }
 
+    /// Attaching a new socket retires the previous peer's identity: the version
+    /// the old one announced must not stand over a socket that never said hello.
     #[tokio::test]
-    async fn ping_on_an_empty_hub_is_not_a_death() {
+    async fn attaching_clears_the_previous_hello() {
         let hub = Hub::new(TOOL_TIMEOUT_MS);
-        assert!(!hub.ping_and_check().await);
+        let (first, _l1) = outbound_sink();
+        let (second, _l2) = outbound_sink();
+        hub.attach(first).await;
+        hub.record_hello("0.3.1".into()).await;
+        hub.attach(second).await;
+        let (connected, version) = hub.extension_state().await;
+        assert!(!connected);
+        assert_eq!(version, "");
     }
 
     #[tokio::test]

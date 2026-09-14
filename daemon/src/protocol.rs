@@ -25,6 +25,9 @@ pub struct ToolCallPayload {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ServerFrame {
     Ping,
+    // Spelled out: `rename_all = "camelCase"` would make this `helloAck`, which
+    // is not the frame the extension has always matched on.
+    #[serde(rename = "hello_ack")]
     HelloAck,
     #[serde(rename = "tool_call")]
     ToolCall {

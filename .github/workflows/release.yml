@@ -207,13 +207,20 @@ jobs:
       # The version was decided in resolve-version, before the daemon was built,
       # so the binary and the npm package carry the same number. Apply it to
       # package.json (and Cargo.toml, so the committed tree matches what shipped).
+      #
+      # Idempotent on purpose: resolve-version publishes package.json's own
+      # version whenever npm has not seen it, so a PR that bumped the version by
+      # hand arrives here already correct — and `npm version` exits non-zero
+      # with "Version not changed" in exactly that case.
       - name: Apply the resolved version
         shell: bash
         env:
           VERSION: ${{ needs.resolve-version.outputs.version }}
         run: |
           set -euo pipefail
-          npm version "$VERSION" --no-git-tag-version --ignore-scripts
+          if [[ "$(node -p "require('./package.json').version")" != "$VERSION" ]]; then
+            npm version "$VERSION" --no-git-tag-version --ignore-scripts
+          fi
           perl -0pi -e 's/^version = "[^"]+"/version = "$ENV{VERSION}"/m unless $done++' daemon/Cargo.toml
           grep -m1 '^version' daemon/Cargo.toml
 

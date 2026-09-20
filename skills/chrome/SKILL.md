@@ -16,9 +16,20 @@ On the **first** `navigate` of a task, also pass `group_title` — a short human
 
 Only call `close_session` when the user explicitly asks ("close those tabs"). Never close a group on your own initiative.
 
+## Reuse over duplication
+
+If the user's Chrome already has the page open, `navigate` **adopts that tab** rather than opening a second copy. The result reports `reused: true` and a `matchKind`:
+
+- `exact` — the tab is already on that URL (a trailing slash or `#fragment` does not matter); nothing is reloaded, so whatever the user had scrolled to or typed survives.
+- `page` — the tab is the plain form of the path and the target adds a query (opening `/search` for `/search?q=cats`); the tab is navigated to the real URL.
+
+A tab that already carries its own query is never hijacked: opening `/search?q=cats` does not take over a tab showing `/search?q=dogs`, because that query is the state of a search the user is reading. A page the bridge adopts belongs to the user: it is never activated or refocused, and `close_tab` / `close_session` **leave it open** (reporting it in `kept`) unless you pass `force: true`. Pass `force: true` only when the user asked for that page itself to be closed.
+
+When the user says "**the tab I have open**", they mean it literally: `navigate` to that page and you will land on their existing tab, cookies, scroll position and all. Reach for `newTab: true` only when two pages of the same URL genuinely must coexist, and for `find_tab` when you need to switch to a tab of a *different* page that is already open.
+
 ## The loop
 
-1. `navigate` to open a page (`newTab: true` when pages must coexist).
+1. `navigate` to open a page — this reuses the user's existing tab when the page is already open (`newTab: true` when pages must coexist). An adopted tab is reported with `reused: true`.
 2. `snapshot` to read it. This returns an accessibility outline, not HTML — one element per line, indented by nesting:
 
    ```

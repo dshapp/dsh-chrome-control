@@ -50,10 +50,10 @@ fn with_session(props: Value, required: &[&str]) -> Value {
 pub static TOOLS: LazyLock<Vec<ToolSpec>> = LazyLock::new(|| vec![
     ToolSpec {
         name: "navigate",
-        description: "Open a URL in the user's real Chrome. The first call in a session creates the session's tab group.",
+        description: "Open a URL in the user's real Chrome, preferring the tab they already have it open in: if the page is already open, that tab is adopted (the result reports reused:true and matchKind) instead of opening a second copy. Pass newTab:true to force a fresh tab. The first call in a session creates the session's tab group; an adopted tab is left where the user put it.",
         input_schema: with_session(json!({
             "url": { "type": "string", "description": "Any absolute URL the browser can open — http(s), file:, about:, data:, or an internal scheme like chrome:. Privileged pages (chrome:// and friends) open as real tabs, but page-reading tools cannot attach to them." },
-            "newTab": { "type": "boolean", "description": "Open a new tab instead of reusing the session's current tab. Use true when pages must coexist." },
+            "newTab": { "type": "boolean", "description": "Open a new tab even if the page is already open (and instead of reusing the session's current tab). Use true when pages must coexist." },
             "group_title": { "type": "string", "description": "Human-readable label for this task's tab group; set it on the first navigate, in the user's language." }
         }), &["url"]),
     },
@@ -72,13 +72,17 @@ pub static TOOLS: LazyLock<Vec<ToolSpec>> = LazyLock::new(|| vec![
     },
     ToolSpec {
         name: "close_tab",
-        description: "Close the session's current tab.",
-        input_schema: session_only(),
+        description: "Close the session's current tab. A tab adopted from the user's own browser (reused:true from navigate, or a find_tab borrow) is refused with closed:false unless force:true is passed — never close a page the user already had open unless they asked for it.",
+        input_schema: with_session(json!({
+            "force": { "type": "boolean", "description": "Close the tab even though it was already open in the user's browser before this task. Only pass when the user explicitly asked for that page to be closed." }
+        }), &[]),
     },
     ToolSpec {
         name: "close_session",
-        description: "Close every tab in this session's tab group. Call only when the user explicitly asks.",
-        input_schema: session_only(),
+        description: "Close every tab this session opened, and release the ones it adopted from the user's own browser, which are left open and reported in kept. Call only when the user explicitly asks; pass force:true to close the adopted tabs too.",
+        input_schema: with_session(json!({
+            "force": { "type": "boolean", "description": "Also close tabs that were already open in the user's browser before this task. Only pass when the user explicitly asked for them to be closed." }
+        }), &[]),
     },
     ToolSpec {
         name: "snapshot",
@@ -361,6 +365,20 @@ mod tests {
         let required = s["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v == "url"));
         assert!(required.iter().any(|v| v == "session"));
+        assert!(
+            TOOLS[0].description.contains("already open"),
+            "navigate must tell the model it reuses an open tab"
+        );
+    }
+
+    #[test]
+    fn close_tools_offer_force_for_borrowed_tabs() {
+        for name in ["close_tab", "close_session"] {
+            let tool = TOOLS.iter().find(|t| t.name == name).unwrap();
+            assert_eq!(tool.input_schema["properties"]["force"]["type"], "boolean", "{name} force");
+            let required = tool.input_schema["required"].as_array().unwrap();
+            assert!(!required.iter().any(|v| v == "force"), "{name} force must be optional");
+        }
     }
 
     #[test]

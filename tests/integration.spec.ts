@@ -9,6 +9,7 @@
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { chmodSync, existsSync, readFileSync } from 'node:fs'
+import * as http from 'node:http'
 import * as path from 'node:path'
 import WebSocket from 'ws'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -27,6 +28,34 @@ const BINARY_CANDIDATES = [
 const BIN = BINARY_CANDIDATES.find(p => existsSync(p))
 const PORT = 37187 // ephemeral test port, avoids clashing with a running daemon
 const BASE = `http://127.0.0.1:${PORT}`
+/** The one extension the daemon trusts (Chrome Web Store id). */
+const EXTENSION_ORIGIN = 'chrome-extension://kgjjicancjnedmappjhefngdjaommpop'
+
+/** Open the control socket the way the real extension does. */
+function extensionSocket(): WebSocket {
+  return new WebSocket(`ws://127.0.0.1:${PORT}/chrome/ws`, { origin: EXTENSION_ORIGIN })
+}
+
+/** Resolve with the HTTP status a refused WebSocket handshake gets. */
+function handshakeStatus(origin?: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${PORT}/chrome/ws`, origin === undefined ? {} : { origin })
+    ws.on('unexpected-response', (_req, res) => { resolve(res.statusCode ?? 0); res.resume() })
+    ws.on('open', () => { ws.close(); reject(new Error(`handshake with origin ${origin} was accepted`)) })
+    ws.on('error', () => {})
+  })
+}
+
+/** GET a path with an explicit Host header (fetch forbids setting Host). */
+function statusWithHost(host: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const req = http.get({ host: '127.0.0.1', port: PORT, path: '/chrome/status', headers: { host } }, res => {
+      res.resume()
+      resolve(res.statusCode ?? 0)
+    })
+    req.on('error', reject)
+  })
+}
 
 let child: ReturnType<typeof spawn> | undefined
 
@@ -122,7 +151,7 @@ describe_e2e('chrome-daemon (end-to-end)', () => {
   })
 
   it('completes a whole tool-call round trip through a WebSocket extension', async () => {
-    const ws = new WebSocket(`ws://127.0.0.1:${PORT}/chrome/ws`)
+    const ws = extensionSocket()
     const opened = new Promise<void>(resolve => ws.on('open', resolve))
     await opened
 
@@ -163,7 +192,7 @@ describe_e2e('chrome-daemon (end-to-end)', () => {
   })
 
   it('reports the extension connected after a hello', async () => {
-    const ws = new WebSocket(`ws://127.0.0.1:${PORT}/chrome/ws`)
+    const ws = extensionSocket()
     await new Promise<void>(resolve => ws.on('open', resolve))
     ws.send(JSON.stringify({ type: 'hello', payload: { extensionVersion: '9.9.9' } }))
     // give the daemon a beat to record hello
@@ -173,6 +202,31 @@ describe_e2e('chrome-daemon (end-to-end)', () => {
     expect(v.extension_connected).toBe(true)
     expect(v.extension_version).toBe('9.9.9')
     ws.close()
+  })
+
+  // The request guard, over a real socket. A browser always attaches Origin to
+  // a POST and to a WebSocket handshake, and a page cannot drop or forge it.
+  it('refuses a control-socket handshake from anything but our extension', async () => {
+    expect(await handshakeStatus()).toBe(403)
+    expect(await handshakeStatus('https://evil.example')).toBe(403)
+    expect(await handshakeStatus('chrome-extension://hjgcllfkbkhmggdopnfhhmaiaedacnpg')).toBe(403)
+  })
+
+  it('refuses /chrome/mcp from a browser origin, even a no-cors text/plain one', async () => {
+    for (const [origin, type] of [['https://evil.example', 'application/json'], ['null', 'text/plain'], [EXTENSION_ORIGIN, 'application/json']]) {
+      const r = await fetch(`${BASE}/chrome/mcp`, {
+        method: 'POST',
+        headers: { origin: origin!, 'content-type': type! },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'tools/list' }),
+      })
+      expect(r.status, `origin ${origin}`).toBe(403)
+    }
+  })
+
+  it('refuses a non-loopback Host (DNS rebinding) and admits loopback names', async () => {
+    expect(await statusWithHost('evil.example:' + PORT)).toBe(403)
+    expect(await statusWithHost('localhost:' + PORT)).toBe(200)
+    expect(await statusWithHost('127.0.0.1:' + PORT)).toBe(200)
   })
 })
 

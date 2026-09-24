@@ -1,14 +1,12 @@
-//! Who may call `/host/*`.
+//! Who may call `/host/*`, and the one extension id the daemon trusts.
 //!
-//! These routes execute subprocesses on the user's machine, so they are guarded
-//! separately from `/chrome/*` — and deliberately *not* by reusing
-//! [`crate::server::origin_allowed`], whose policy is wrong here in two ways:
-//!
-//!   - it accepts any `chrome-extension://` prefix, which would let *any*
-//!     installed extension drive git and the plugin manager;
-//!   - it accepts a missing `Origin`, because a non-browser client (curl, the
-//!     test suite) legitimately drives the control socket. For `/host/*` the
-//!     absent header is the signature of exactly the caller we cannot vouch for.
+//! These routes execute subprocesses on the user's machine. The router-wide
+//! [`crate::request_guard`] already admits them only for [`ALLOWED_ORIGIN`];
+//! [`permits`] repeats that check inside each handler as a second layer, so a
+//! future router refactor that drops the middleware cannot silently open them.
+//! It is an exact `==`, never a prefix test (which would admit every installed
+//! extension), and a missing `Origin` is refused — for `/host/*` the absent
+//! header is the signature of exactly the caller we cannot vouch for.
 //!
 //! # The security model, stated plainly
 //!
@@ -41,9 +39,12 @@ use axum::http::HeaderMap;
 
 /// The one extension allowed to drive host operations.
 ///
-/// The id is fixed by the `key` in the extension's manifest, and is the same id
-/// the Native Messaging host manifest pins in its `allowed_origins`.
-pub const ALLOWED_ORIGIN: &str = "chrome-extension://hjgcllfkbkhmggdopnfhhmaiaedacnpg";
+/// This is the Chrome Web Store id of "Deepseek Harness APP". The extension
+/// repository's `manifest.json` carries the store's public key as `key`, so an
+/// unpacked development build gets the same id, and the Native Messaging host
+/// manifest pins the same value in its `allowed_origins`. It is also the only
+/// origin [`crate::request_guard`] lets open `/chrome/ws`.
+pub const ALLOWED_ORIGIN: &str = "chrome-extension://kgjjicancjnedmappjhefngdjaommpop";
 
 /// Reject anything that is not exactly our extension.
 ///
@@ -77,7 +78,7 @@ mod tests {
 
     #[test]
     fn missing_origin_is_rejected() {
-        // Deliberately the opposite of server::origin_allowed, which allows a
+        // Deliberately the opposite of the local-only routes, which require a
         // headerless caller. Asserted so a later "let's unify these" refactor
         // fails loudly instead of silently opening /host/* to every local process.
         assert_eq!(permits(&HeaderMap::new()), Err("origin required"));
@@ -90,7 +91,7 @@ mod tests {
 
     #[test]
     fn another_extension_is_rejected() {
-        // The prefix-matching policy used by /chrome/* would accept this.
+        // A prefix policy (`starts_with("chrome-extension://")`) would accept this.
         assert_eq!(
             permits(&headers_with("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             Err("origin not authorized")
@@ -100,8 +101,13 @@ mod tests {
     #[test]
     fn a_prefix_of_the_allowed_origin_is_rejected() {
         // Guards against someone reintroducing starts_with in either direction.
-        assert!(permits(&headers_with("chrome-extension://hjgcllfkbkhmggdopnfhhmaiaedacnp")).is_err());
-        assert!(permits(&headers_with("chrome-extension://hjgcllfkbkhmggdopnfhhmaiaedacnpgX")).is_err());
+        assert!(permits(&headers_with("chrome-extension://kgjjicancjnedmappjhefngdjaommpo")).is_err());
+        assert!(permits(&headers_with("chrome-extension://kgjjicancjnedmappjhefngdjaommpopX")).is_err());
+    }
+
+    #[test]
+    fn the_old_development_id_is_rejected() {
+        assert!(permits(&headers_with("chrome-extension://hjgcllfkbkhmggdopnfhhmaiaedacnpg")).is_err());
     }
 
     #[test]

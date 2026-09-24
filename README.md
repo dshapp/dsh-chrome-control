@@ -2,22 +2,36 @@
 
 A DeepSeek Harness bundle that gives the agent control of the user's **real
 Chrome** — their profile, their logins, their open tabs — as `mcp__chrome__*`
-tools. Pure TypeScript: no separate daemon process, no binaries.
+tools. The Chrome bridge runs in a small standalone Rust process,
+`chrome-daemon`, which this plugin starts and adopts.
+
+> **Requires the Chrome extension.** This plugin is only the server half. It
+> must be used together with the **Deepseek Harness APP** Chrome extension from
+> the Chrome Web Store:
+> <https://chromewebstore.google.com/detail/deepseek-harness-app/kgjjicancjnedmappjhefngdjaommpop>
+>
+> Without the extension installed and connected, every `mcp__chrome__*` tool
+> reports that no Chrome extension is attached.
 
 ## How it fits together
 
 ```
-agent ──MCP──▶ dsh web (shared HTTP server, default :3080)
-                 ├─ POST /chrome/mcp     MCP Streamable HTTP endpoint
-                 ├─ GET  /chrome/ws  ────WebSocket──▶ extension ──CDP──▶ page
-                 └─ GET  /chrome/status  liveness probe
+agent ──▶ dsh web :3080 ── in-box mcp-client (Node) ──HTTP──┐
+            └─ GET /chrome/status  (proxied to the daemon)  │
+                                                            ▼
+          chrome-daemon  127.0.0.1:37086  (Rust, detached, outlives dsh web)
+            ├─ POST /chrome/mcp       MCP Streamable HTTP endpoint   ← dsh web only
+            ├─ GET  /chrome/status    liveness / build probe         ← dsh web only
+            ├─ POST /chrome/shutdown  retire a stale build           ← dsh web only
+            ├─ GET  /chrome/ws  ◀──WebSocket── extension ──CDP──▶ page
+            └─ POST /host/*           settings-UI host operations    ← extension only
 ```
 
 The bundle's patch contributes two rows:
 
 | Row | Job |
 |---|---|
-| `chrome-server` | Mounts the three routes above on the harness's own `webServer`, and loads the in-box `@deepseek-ai/dsh-mcp-client` bridge against `/chrome/mcp` — using the web server's **actual** listening port, so no port is configured anywhere. The bridge publishes the catalog as `mcp__chrome__*`. |
+| `chrome-server` | Starts `chrome-daemon` on `127.0.0.1:37086` (or reuses a running one with the same build hash, retiring a stale one), proxies `/chrome/status` on the harness's own `webServer`, and loads the in-box `@deepseek-ai/dsh-mcp-client` bridge against the daemon's `/chrome/mcp`. The bridge publishes the catalog as `mcp__chrome__*`. |
 | `chrome-skills` | Registers the bundled skill that teaches the agent how to drive those tools. |
 
 ## Install
@@ -26,27 +40,49 @@ The bundle's patch contributes two rows:
 dsh plugin --profile web add dsh-chrome-control     # or a link: dependency for local dev
 ```
 
-Then **install the browser extension yourself** — loading an unpacked extension
-is a decision only the browser's owner can make, so nothing does it for you.
-Point the extension's *DSH server* address at the same `dsh web` URL (default
+Then **install the browser extension yourself** from the
+[Chrome Web Store — Deepseek Harness APP](https://chromewebstore.google.com/detail/deepseek-harness-app/kgjjicancjnedmappjhefngdjaommpop)
+(click *Add to Chrome*). Installing an extension is a decision only the
+browser's owner can make, so nothing does it for you. Point the extension's *DSH server* address at the same `dsh web` URL (default
 `http://127.0.0.1:3080`); it derives the bridge socket `ws(s)://…/chrome/ws`
 from it. Until it is connected, every tool returns a message saying exactly
 that.
 
+## Native Messaging host (installed on every boot)
+
+The store extension cannot start processes, so it relies on a Native Messaging
+host, `com.dsh.chrome`, for exactly two things: **starting `dsh web`** when it
+is down, and **signing the login cookie** with the browser-session secret in
+`$DSH_HOME/.credentials.yaml`. This plugin registers it every time dsh boots —
+there is no separate installer to run:
+
+```
+$DSH_HOME/native-host/dsh-native-host.mjs   the host (copied from native-host/ in this package)
+$DSH_HOME/native-host/dsh-native-host       launcher Chrome executes; absolute node, forwards argv
+$DSH_HOME/native-host/config.json           node + entry of the dsh that booted, used to start it again
+<browser>/NativeMessagingHosts/com.dsh.chrome.json   for each Chromium-family browser present
+```
+
+Writes are compare-then-rename, so an unchanged boot touches nothing; failures
+are logged and never stop the plugin. macOS and Linux only.
+
+Only `chrome-extension://kgjjicancjnedmappjhefngdjaommpop` may call it, checked
+twice: Chrome enforces the manifest's `allowed_origins`, and the host itself
+compares the caller origin Chrome passes as its first argument, refusing
+anything else before it reads a message. It will also only start dsh on a
+loopback host.
+
 ## Behaviour worth knowing
 
-- **No port configuration.** The routes live on whatever port `dsh web`
-  listens on; the internal MCP bridge reads that port at load time. Change the
-  web port and everything follows.
+- **Fixed daemon port.** The daemon always listens on `127.0.0.1:37086`,
+  which is also the extension's default bridge address
+  (`ws://127.0.0.1:37086/chrome/ws`). It is detached, so it survives `dsh web`
+  restarts; stop it with `kill -TERM <pid>`.
 - **Startup order does not matter.** The bridge is loaded with
   `failOnStartupError: false` and its own reconnect policy; the extension may
   attach at any time.
 - **This plugin needs the `webServer` service** (the Web composition). In a
   profile without it, the row stays pending and nothing breaks.
-- **Migrating from the daemon versions:** the old standalone `chrome-daemon`
-  (port 37086) is no longer used. If one is still running, stop it with
-  `~/.dsh-chrome/bin/chrome-daemon stop` and delete `~/.dsh-chrome`; this
-  plugin never kills processes it does not own.
 - **Response size guards.** Text tool results are capped at 256 KiB (with a
   trailing `[truncated]` marker) and top-level arrays past 4000 elements are
   sliced; the extension WebSocket frame limit is 8 MiB. These keep a giant
@@ -74,10 +110,30 @@ skill tells the agent when to use which.
 While the extension is connected the agent acts with **your logged-in
 sessions**, `upload` may expose explicitly named local files to the page, and `mouse_click`/`key_type` send *trusted* input that pages cannot
 distinguish from your own. The extension popup has an **Allow agent control**
-toggle that severs this immediately. The WebSocket endpoint only accepts
-upgrades whose `Origin` is a `chrome-extension://` page (or none, for local
-probes); a web page that finds the endpoint cannot attach. Everything binds to
-whatever interface `dsh web` itself is configured for, and sends no telemetry.
+toggle that severs this immediately. The daemon binds to the loopback only
+and sends no telemetry.
+
+### Who may call the daemon
+
+Every request passes one gate (`daemon/src/request_guard.rs`) before any route
+runs, 404s included. It relies only on headers a browser sets and a web page
+can neither drop nor forge:
+
+| Check | Rule |
+|---|---|
+| `Host` | when present, must be `127.0.0.1`, `localhost` or `[::1]` — defeats DNS rebinding, whose requests still carry the attacker's name |
+| `/chrome/ws`, `/host/*` | `Origin` must equal `chrome-extension://kgjjicancjnedmappjhefngdjaommpop` **exactly** — refuses pages, every other extension, and a missing `Origin` |
+| everything else (`/chrome/mcp`, `/chrome/status`, `/chrome/shutdown`, future routes) | **no `Origin` at all** — the caller is `dsh web`'s Node client; any browser request (fetch, `no-cors`, form post) carries one and is refused |
+
+The extension id is the Chrome Web Store id, defined once in
+`daemon/src/host_guard.rs`. The extension repository ships the store's public
+key as `key` in `manifest.json`, so an unpacked development build has the same
+id; strip `key` when packaging for the store.
+
+Not covered: another local process running as the same user, which can send
+any header. That is accepted — such a process can already drive Chrome's
+profile, `git` and `pnpm` directly, and a token file would be readable by it
+just the same.
 
 ## Host operations (`/host/*`)
 
@@ -132,9 +188,9 @@ When dsh is not a pnpm install, these routes return 400 with
 `/host/*` requires `Origin` to equal the one authorized extension exactly, and
 is served only when the daemon is bound to loopback. That stops web pages
 (browsers will not let a page forge an extension origin) and other extensions
-(compared with `==`, not `starts_with` — the `/chrome/*` helper's prefix policy
-would admit any extension and also allows a missing `Origin`, so it is
-deliberately not reused).
+(compared with `==`, never `starts_with`, which would admit any extension). The
+router-wide gate above enforces this first; each `/host/*` handler checks it
+again, so dropping the middleware in a refactor cannot open these routes.
 
 It does **not** stop another local process running as the same user: such a
 process can set any `Origin`, and loopback TCP exposes no peer pid or uid. This

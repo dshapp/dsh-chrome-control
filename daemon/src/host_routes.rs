@@ -5,9 +5,10 @@
 //!   - `/chrome/mcp` is JSON-RPC for the agent; these are plain REST for the
 //!     extension's own settings UI. Sharing a codec would couple two things
 //!     that change for unrelated reasons.
-//!   - The two have different guards. `/chrome/*` admits a caller with no
-//!     `Origin`; `/host/*` must not, because it runs subprocesses. See
-//!     [`crate::host_guard`].
+//!   - The two have different guards. `/chrome/mcp` and friends admit only a
+//!     caller with no `Origin` (dsh web); `/host/*` admits only the one
+//!     authorized extension, because it runs subprocesses. See
+//!     [`crate::request_guard`] and [`crate::host_guard`].
 //!   - Nothing here touches the control WebSocket. Opening a second connection
 //!     to `/chrome/ws` makes the hub fail the extension's in-flight calls and
 //!     drop it for tens of seconds, so host operations ride their own HTTP

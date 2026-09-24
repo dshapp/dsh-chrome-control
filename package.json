@@ -29,6 +29,7 @@
   "files": [
     "lib/**/*.js",
     "binaries/**/*",
+    "native-host/**/*",
     "cordis.patch.yml",
     "skills/**/*"
   ],

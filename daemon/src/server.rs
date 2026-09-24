@@ -6,6 +6,11 @@
 //!   - `POST /chrome/shutdown` — cooperative stop, so an upgraded `dsh web`
 //!     can retire a stale daemon it does not own (it has no PID for an orphan
 //!     left behind by an earlier session).
+//!
+//! Every route, `/host/*` included, sits behind [`crate::request_guard`]: the
+//! extension routes admit only the one authorized extension `Origin`, the rest
+//! admit only callers with no `Origin` at all (i.e. not a browser), and any
+//! non-loopback `Host` is refused. Handlers here therefore do no origin checks.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -13,7 +18,7 @@ use std::time::Instant;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -90,17 +95,9 @@ pub fn router_with_options(shutdown: Arc<Notify>, host_loopback: bool) -> Router
         .route("/chrome/shutdown", post(shutdown_handler))
         // Host operations ride their own routes and their own stricter guard.
         .merge(crate::host_routes::router())
+        // Outermost: runs before any route, including a 404.
+        .layer(axum::middleware::from_fn(crate::request_guard::guard))
         .with_state(state)
-}
-
-/// Only a browser extension page may open the control socket. Chrome sends
-/// `Origin: chrome-extension://<id>`; anything else is refused. A non-browser
-/// client (tests, curl) sends no Origin and is allowed.
-fn origin_allowed(headers: &HeaderMap) -> bool {
-    match headers.get("origin") {
-        None => true,
-        Some(v) => v.to_str().map(|s| s.starts_with("chrome-extension://")).unwrap_or(false),
-    }
 }
 
 /// MCP requests. A notification yields 202 with an empty body; everything else
@@ -139,23 +136,18 @@ async fn status_handler(State(state): State<AppState>) -> Json<Value> {
 
 /// Cooperative shutdown, so an upgraded `dsh web` can retire a stale daemon.
 ///
-/// Guarded by the same origin check as the control socket: a web page cannot
-/// stop the daemon, while a local caller without an `Origin` header (dsh web,
-/// curl) may. The reply is sent before the server winds down.
-async fn shutdown_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !origin_allowed(&headers) {
-        return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
-    }
+/// Local callers only (no `Origin`), enforced by the request guard: a web page
+/// cannot stop the daemon, while dsh web and curl may. The reply is sent before
+/// the server winds down.
+async fn shutdown_handler(State(state): State<AppState>) -> Response {
     tracing::info!("shutdown requested over HTTP");
     state.shutdown.notify_waiters();
     (StatusCode::ACCEPTED, "shutting down").into_response()
 }
 
-/// WebSocket upgrade handler for the extension.
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !origin_allowed(&headers) {
-        return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
-    }
+/// WebSocket upgrade handler for the extension. Only the authorized extension
+/// `Origin` gets this far; the request guard refuses everyone else.
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     ws.max_message_size(WS_MAX_MESSAGE)
         .on_upgrade(move |socket| serve_extension(socket, state))
 }
@@ -355,25 +347,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn origin_allowed_chrome_extension() {
-        let mut h = HeaderMap::new();
-        h.insert("origin", "chrome-extension://abc".parse().unwrap());
-        assert!(origin_allowed(&h));
-    }
-
-    #[test]
-    fn origin_blocked_web_page() {
-        let mut h = HeaderMap::new();
-        h.insert("origin", "https://evil.com".parse().unwrap());
-        assert!(!origin_allowed(&h));
-    }
-
-    #[test]
-    fn origin_allowed_when_absent() {
-        let h = HeaderMap::new();
-        assert!(origin_allowed(&h));
     }
 }

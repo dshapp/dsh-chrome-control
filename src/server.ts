@@ -27,6 +27,7 @@ import type { Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
 import * as McpClient from '@deepseek-ai/dsh-mcp-client'
+import { installNativeHost } from './native-host.ts'
 // Type-only: contributes the `webServer` service augmentation to Context.
 import type {} from '@deepseek-ai/dsh-host-webserver'
 
@@ -310,6 +311,11 @@ export function apply(ctx: Context): void {
   const log = ctx.logger
 
   void ensureDaemon(log)
+
+  // Register the Native Messaging host the store extension uses to start dsh
+  // web and to get its login cookie. Idempotent, never throws; records the node
+  // and entry of *this* dsh so the host launches the same install.
+  installNativeHost({ log })
 
   ctx.effect(() =>
     ctx.webServer.register({ kind: 'exact', path: STATUS_PATH, handler: createStatusProxyHandler() }),

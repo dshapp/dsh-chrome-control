@@ -15,6 +15,7 @@ mod host_server_ops;
 mod hub;
 mod mcp;
 mod protocol;
+mod request_guard;
 mod server;
 mod tools_catalog;
 

@@ -18,9 +18,12 @@
 //! from CORS for hosts in its `host_permissions`, so it does not need them, and
 //! adding them would hand the same routes to ordinary web pages.
 
+include!("host_routes_update_tests.rs");
+
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
@@ -67,6 +70,20 @@ struct PluginRequest {
     // that carries one is ignored by serde rather than honoured.
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerTargetRequest {
+    #[serde(default = "default_target")]
+    target: String,
+}
+fn default_target() -> String { "latest".to_string() }
+/// Empty bodies and {} retain the historical latest default; null/extra keys fail closed.
+fn server_target(body: &[u8]) -> Result<String, String> {
+    let request = if body.is_empty() { ServerTargetRequest { target: default_target() } }
+        else { serde_json::from_slice::<ServerTargetRequest>(body).map_err(|e| format!("invalid server target request: {e}"))? };
+    ops::validate_update_target(&request.target)?;
+    Ok(request.target)
+}
 /// Mount the host routes.
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -256,18 +273,24 @@ async fn plugin(State(state): State<AppState>, headers: HeaderMap, body: Option<
     }
 }
 
-async fn server_version(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn server_version(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     if let Err(response) = admit(&state, &headers) {
         return response;
     }
+    let target = match server_target(&body) { Ok(target) => target, Err(reason) => return bad_request(reason) };
     let current = match ops::current_version().await {
         Ok(version) => version,
         Err(err) => return server_op_failure(err),
     };
-    // Offline is ordinary, so a missing `latest` is data, not an error.
-    let latest = ops::latest_version().await;
-    let updatable = latest.as_ref().is_some_and(|l| *l != current);
-    Json(json!({ "current": current, "latest": latest, "updatable": updatable })).into_response()
+    // Offline is ordinary, so missing registry data is not an HTTP error.
+    let dist_tags = ops::dist_tags().await;
+    let tags = dist_tags.clone().unwrap_or_default();
+    let latest = tags.get("latest").cloned();
+    let target_version = if ops::is_exact_version(&target) { ops::exact_version(&target).await }
+        else { ops::select_target_version(&target, &tags) };
+    let updatable = target_version.as_ref().is_some_and(|v| ops::compare_versions(&current, v) == Some(std::cmp::Ordering::Less));
+    Json(json!({ "current": current, "latest": latest, "updatable": updatable,
+        "distTags": dist_tags, "target": target, "targetVersion": target_version, "updateSupported": true })).into_response()
 }
 
 async fn server_restart(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -357,17 +380,18 @@ async fn restart_reply(
     }
 }
 
-async fn server_update(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn server_update(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     if let Err(response) = admit(&state, &headers) {
         return response;
     }
     let locks = state.host_locks.clone();
+    let target = match server_target(&body) { Ok(target) => target, Err(reason) => return bad_request(reason) };
     let Ok(_guard) = locks.update.try_lock() else {
         return (StatusCode::CONFLICT, Json(json!({ "error": "an update is already running" }))).into_response();
     };
     // Intentionally does not restart afterwards: a restart drops the user's
     // live session, so the UI asks first.
-    match ops::update().await {
+    match ops::update(&target).await {
         Ok(out) => exec_response(out),
         Err(err) => server_op_failure(err),
     }

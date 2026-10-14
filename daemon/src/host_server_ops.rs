@@ -1,9 +1,9 @@
 //! Restarting and updating `dsh web`, and reporting its version.
 //!
-//! # Why these operations take no arguments
+//! # Why update targets are restricted
 //!
-//! Each entry point below is deliberately parameterless (restart takes only a
-//! port, and that port must be allowlisted). A "restart" that accepted a pid
+//! Updates accept only latest/next/alpha or strict exact SemVer for the fixed
+//! DSH package. Restart takes only an allowlisted port. A "restart" that accepted a pid
 //! would be `kill`; an "update" that accepted a package name would be
 //! `pnpm add -g <anything>`. Since the guard is Origin-only
 //! ([`crate::host_guard`]), the shape of these functions *is* the security
@@ -24,6 +24,8 @@
 //! (`global/v11/<hash>/node_modules/...`) whose `<hash>` changes on every
 //! reinstall, so a resolved inner path is only valid until the next update —
 //! precisely when a restart is most likely to be requested.
+
+include!("host_server_ops_update_tests.rs");
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -215,9 +217,54 @@ pub fn is_dsh_web_command(command: &str) -> bool {
         || tokens.iter().any(|token| *token == "web")
 }
 
+/// Strict SemVer parser. Decimal strings avoid overflow and build metadata is ignored.
+#[derive(Debug)]
+struct SemVersion<'a> { main: Vec<&'a str>, pre: Option<Vec<&'a str>> }
+fn numeric(s: &str) -> bool { !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) }
+fn identifiers(s: &str, prerelease: bool) -> bool {
+    s.split('.').all(|part| !part.is_empty()
+        && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !(prerelease && numeric(part) && part.len() > 1 && part.starts_with('0')))
+}
+fn sem_version(value: &str) -> Option<SemVersion<'_>> {
+    if value.len() > 256 { return None; }
+    let (version, build) = value.split_once('+').map_or((value, None), |(v,b)| (v,Some(b)));
+    if build.is_some_and(|b| !identifiers(b, false)) { return None; }
+    let (main, pre) = version.split_once('-').map_or((version, None), |(v,p)| (v,Some(p)));
+    let main: Vec<_> = main.split('.').collect();
+    if main.len() != 3 || main.iter().any(|p| !numeric(p) || (p.len() > 1 && p.starts_with('0'))) { return None; }
+    if pre.is_some_and(|p| !identifiers(p, true)) { return None; }
+    Some(SemVersion { main, pre: pre.map(|p| p.split('.').collect()) })
+}
+pub fn is_exact_version(value: &str) -> bool { sem_version(value).is_some() }
+fn decimal(a: &str, b: &str) -> std::cmp::Ordering { a.len().cmp(&b.len()).then_with(|| a.cmp(b)) }
+pub fn compare_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering::*;
+    let a = sem_version(left)?; let b = sem_version(right)?;
+    for (x,y) in a.main.iter().zip(&b.main) { let c = decimal(x,y); if c != Equal { return Some(c); } }
+    match (a.pre, b.pre) {
+        (None,None) => Some(Equal), (None,Some(_)) => Some(Greater), (Some(_),None) => Some(Less),
+        (Some(a),Some(b)) => {
+            for (x,y) in a.iter().zip(&b) {
+                let c = match (numeric(x),numeric(y)) { (true,true) => decimal(x,y), (true,false) => Less, (false,true) => Greater, _ => x.cmp(y) };
+                if c != Equal { return Some(c); }
+            }
+            Some(a.len().cmp(&b.len()))
+        }
+    }
+}
+/// Only these tags, or an exact version, can ever enter fixed-package argv.
+pub fn validate_update_target(target: &str) -> Result<&str, String> {
+    if ["latest", "next", "alpha"].contains(&target) || is_exact_version(target) { Ok(target) }
+    else { Err("DSH update target must be latest, next, alpha or an exact semantic version".to_string()) }
+}
+pub fn update_target_args(target: &str) -> Result<Vec<String>, String> {
+    validate_update_target(target)?;
+    Ok(vec!["add".to_string(), "-g".to_string(), format!("{DSH_PACKAGE}@{target}")])
+}
 /// The argument vector for updating dsh. Always pnpm, always this package.
 pub fn update_args() -> Vec<String> {
-    vec!["add".to_string(), "-g".to_string(), format!("{DSH_PACKAGE}@latest")]
+    update_target_args("latest").expect("latest is allowlisted")
 }
 
 /// The argument vector that starts `dsh web`.
@@ -251,24 +298,47 @@ pub async fn current_version() -> Result<String, ServerOpError> {
 ///
 /// A failure is not an error for the caller: being offline is ordinary, and the
 /// UI shows "cannot check" rather than an alarming message.
-pub async fn latest_version() -> Option<String> {
+pub fn dist_tag_args() -> Vec<String> {
+    vec!["view".into(), DSH_PACKAGE.into(), "dist-tags".into(), "--json".into()]
+}
+pub fn parse_dist_tags(text: &str) -> Option<HashMap<String, String>> {
+    let values: serde_json::Value = serde_json::from_str(text).ok()?;
+    let object = values.as_object()?;
+    Some(object.iter().filter_map(|(tag, value)| {
+        let version = value.as_str()?;
+        (["latest", "next", "alpha"].contains(&tag.as_str()) && is_exact_version(version))
+            .then(|| (tag.clone(), version.to_string()))
+    }).collect())
+}
+pub async fn dist_tags() -> Option<HashMap<String, String>> {
     let pnpm = resolve_pnpm().ok()?;
-    let args = vec!["view".to_string(), DSH_PACKAGE.to_string(), "version".to_string()];
+    let out = host_exec::run(&pnpm, &dist_tag_args(), None, &HashMap::new(), VIEW_TIMEOUT).await.ok()?;
+    if out.exit_code != Some(0) { return None; }
+    parse_dist_tags(&out.stdout)
+}
+pub fn select_target_version(target: &str, tags: &HashMap<String, String>) -> Option<String> {
+    if is_exact_version(target) { Some(target.to_string()) }
+    else { tags.get(target).filter(|v| is_exact_version(v)).cloned() }
+}
+/// Verify exact versions exist in this fixed package; unavailable/offline is null.
+pub async fn exact_version(target: &str) -> Option<String> {
+    if !is_exact_version(target) { return None; }
+    let pnpm = resolve_pnpm().ok()?;
+    let args = vec!["view".into(), format!("{DSH_PACKAGE}@{target}"), "version".into(), "--json".into()];
     let out = host_exec::run(&pnpm, &args, None, &HashMap::new(), VIEW_TIMEOUT).await.ok()?;
-    if out.exit_code != Some(0) {
-        return None;
-    }
-    let text = out.stdout.trim();
-    text.is_empty().then_some(None).unwrap_or_else(|| Some(text.split_whitespace().last().unwrap_or(text).to_string()))
+    if out.exit_code != Some(0) { return None; }
+    let version: String = serde_json::from_str(&out.stdout).ok()?;
+    (version == target).then_some(version)
 }
 
 /// Install the newest dsh with pnpm.
-pub async fn update() -> Result<ExecOutput, ServerOpError> {
+pub async fn update(target: &str) -> Result<ExecOutput, ServerOpError> {
+    let args = if target == "latest" { update_args() } else { update_target_args(target).map_err(ServerOpError::Failed)? };
     let pnpm = resolve_pnpm()?;
     // Confirm dsh is a pnpm-managed install *before* touching anything, so we
     // never "successfully" update a copy that is not the one being launched.
     resolve_dsh()?;
-    host_exec::run(&pnpm, &update_args(), None, &HashMap::new(), host_exec::INSTALL_TIMEOUT)
+    host_exec::run(&pnpm, &args, None, &HashMap::new(), host_exec::INSTALL_TIMEOUT)
         .await
         .map_err(|e| ServerOpError::Failed(e.message()))
 }

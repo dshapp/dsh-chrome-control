@@ -290,23 +290,37 @@ pub fn web_args(host: &str, port: u16) -> Vec<String> {
 /// installed copy is already new while the server is still the old one, and
 /// reporting the installed version would make the update look applied. Only
 /// when no server can be read does this fall back to the installed copy.
-pub async fn current_version() -> Result<String, ServerOpError> {
-    if let Some(version) = running_version(&RealSystem, managed_port()) {
+pub async fn current_version(launched: Option<Launched>) -> Result<String, ServerOpError> {
+    if let Some(version) = running_version(&RealSystem, managed_port(), launched) {
         return Ok(version);
     }
     installed_version().await
 }
 
-/// The version of the `dsh web` listening on `port`, read from the package its
-/// command line runs (`…/@deepseek-ai/dsh/lib/bin.js`).
+/// The pid and version of a `dsh web` this daemon started, recorded at launch.
+pub type Launched = (u32, String);
+
+/// The version of the `dsh web` listening on `port`.
+///
+/// A server this daemon started reports the version recorded when it was
+/// launched: an in-place install (npm global) rewrites the package on disk, so
+/// only the launch-time record still names the code the process loaded.
+/// Otherwise the version is read from the package its command line runs
+/// (`…/@deepseek-ai/dsh/lib/bin.js`).
 ///
 /// `dsh web` publishes no version over HTTP, so the process is the source. A
 /// pnpm install runs a content-addressed directory, so that path keeps naming
 /// the version the process loaded even after an update installs another one.
 /// Bin shims are deliberately not followed: a shim resolves to whatever is
 /// installed *now*, which is the very mistake this avoids.
-pub fn running_version<P: SystemProbe>(probe: &P, port: u16) -> Option<String> {
-    let command = probe.command_of(probe.pid_on_port(port)?)?;
+pub fn running_version<P: SystemProbe>(probe: &P, port: u16, launched: Option<Launched>) -> Option<String> {
+    let pid = probe.pid_on_port(port)?;
+    if let Some((launched_pid, version)) = launched {
+        if launched_pid == pid {
+            return Some(version);
+        }
+    }
+    let command = probe.command_of(pid)?;
     if !is_dsh_web_command(&command) {
         return None;
     }
@@ -327,7 +341,7 @@ fn dsh_package_dir(command: &str) -> Option<PathBuf> {
 }
 
 /// Read the installed dsh version, from the copy that will actually be started.
-async fn installed_version() -> Result<String, ServerOpError> {
+pub async fn installed_version() -> Result<String, ServerOpError> {
     let dsh = resolve_dsh()?;
     let out = host_exec::run(&dsh, &["--version".to_string()], None, &HashMap::new(), VIEW_TIMEOUT)
         .await
@@ -631,13 +645,17 @@ mod tests {
         let command = format!("/usr/local/bin/node {} web --host 127.0.0.1 --port 3080", dir.join("lib/bin.js").display());
         assert_eq!(dsh_package_dir(&command), Some(dir.clone()));
         let probe = FakeSystem { pid: Some(7), command: Some(command) };
-        assert_eq!(running_version(&probe, managed_port()), Some("0.2.1-alpha.2".into()));
+        assert_eq!(running_version(&probe, managed_port(), None), Some("0.2.1-alpha.2".into()));
+        // A server this daemon launched keeps its launch-time version, even if the
+        // package on disk has since been rewritten; another pid does not.
+        assert_eq!(running_version(&probe, managed_port(), Some((7, "0.1.0".into()))), Some("0.1.0".into()));
+        assert_eq!(running_version(&probe, managed_port(), Some((8, "0.1.0".into()))), Some("0.2.1-alpha.2".into()));
         // Not running, not dsh web, or launched through a shim: no running version.
         for command in [None, Some("/usr/sbin/httpd".to_string()), Some(PNPM_SHIM_WEB.to_string())] {
             let probe = FakeSystem { pid: Some(7), command };
-            assert_eq!(running_version(&probe, managed_port()), None);
+            assert_eq!(running_version(&probe, managed_port(), None), None);
         }
-        assert_eq!(running_version(&FakeSystem { pid: None, command: None }, managed_port()), None);
+        assert_eq!(running_version(&FakeSystem { pid: None, command: None }, managed_port(), Some((7, "0.1.0".into()))), None);
         std::fs::remove_dir_all(root).unwrap();
     }
 

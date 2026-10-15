@@ -283,7 +283,8 @@ async fn server_version(State(state): State<AppState>, headers: HeaderMap, body:
         return response;
     }
     let target = match server_target(&body) { Ok(target) => target, Err(reason) => return bad_request(reason) };
-    let current = match ops::current_version().await {
+    let launched = state.launched_dsh.lock().unwrap().clone();
+    let current = match ops::current_version(launched).await {
         Ok(version) => version,
         Err(err) => return server_op_failure(err),
     };
@@ -317,6 +318,10 @@ async fn server_restart(State(state): State<AppState>, headers: HeaderMap) -> Re
         Err(err) => return server_op_failure(err),
     };
 
+    // What the shim is about to launch, read before anything stops: once
+    // running, an in-place reinstall can rewrite the package under it.
+    let launch_version = ops::installed_version().await.ok();
+
     // Ask first, insist second: SIGTERM lets the server close its sessions.
     // `libc` is a Unix-only dependency, so the signals go through a platform
     // shim rather than being called directly.
@@ -344,6 +349,7 @@ async fn server_restart(State(state): State<AppState>, headers: HeaderMap) -> Re
                 Err(_) => {
                     command.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
                     let spawned = command.spawn();
+                    record_launch(&state, &spawned, launch_version);
                     return restart_reply(spawned, stopped, port, &log_path).await;
                 }
             };
@@ -354,7 +360,18 @@ async fn server_restart(State(state): State<AppState>, headers: HeaderMap) -> Re
         }
     }
     let spawned = command.spawn();
+    record_launch(&state, &spawned, launch_version);
     restart_reply(spawned, stopped, port, &log_path).await
+}
+
+/// Remember which version the new server was launched as, keyed by its pid.
+///
+/// The shim `exec`s node, so the pid spawned is the pid that will listen.
+fn record_launch(state: &AppState, spawned: &std::io::Result<std::process::Child>, version: Option<String>) {
+    *state.launched_dsh.lock().unwrap() = match (spawned, version) {
+        (Ok(child), Some(version)) => Some((child.id(), version)),
+        _ => None,
+    };
 }
 
 /// Wait for the replacement to answer, then report what happened.

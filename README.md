@@ -188,7 +188,7 @@ so an update that has not been restarted into still shows the old version. A
 server this daemon restarted reports the `dsh --version` recorded just before
 launching it (an in-place install rewrites the package under a running
 process); any other is read from the package its command line runs
-(`…/@deepseek-ai/dsh/lib/bin.js`). Only when no server can be read does it fall
+(`…/@deepseek-ai/dsh/lib/bin.js`, or the one a `dsh` bin link resolves to). Only when no server can be read does it fall
 back to `$PNPM_HOME/dsh --version`.
 
 ### The guard, and what it does not cover

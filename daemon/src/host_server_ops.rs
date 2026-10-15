@@ -311,8 +311,9 @@ pub type Launched = (u32, String);
 /// `dsh web` publishes no version over HTTP, so the process is the source. A
 /// pnpm install runs a content-addressed directory, so that path keeps naming
 /// the version the process loaded even after an update installs another one.
-/// Bin shims are deliberately not followed: a shim resolves to whatever is
-/// installed *now*, which is the very mistake this avoids.
+/// A bin link (`node /opt/homebrew/bin/dsh web`) is resolved to the package it
+/// points at; that is what is installed *now*, the best left once no launch
+/// record exists.
 pub fn running_version<P: SystemProbe>(probe: &P, port: u16, launched: Option<Launched>) -> Option<String> {
     let pid = probe.pid_on_port(port)?;
     if let Some((launched_pid, version)) = launched {
@@ -332,10 +333,14 @@ pub fn running_version<P: SystemProbe>(probe: &P, port: u16, launched: Option<La
     manifest["version"].as_str().filter(|v| is_exact_version(v)).map(str::to_string)
 }
 
-/// The package directory of the `…/lib/bin.js` entry in a command line.
+/// The package directory of the `…/lib/bin.js` entry in a command line,
+/// following a `dsh` bin link to the entry it names.
 fn dsh_package_dir(command: &str) -> Option<PathBuf> {
     command.split_whitespace().find_map(|token| {
-        let entry = std::path::Path::new(token);
+        let mut entry = PathBuf::from(token);
+        if entry.file_name().is_some_and(|name| name == "dsh") {
+            entry = std::fs::canonicalize(&entry).ok()?;
+        }
         if entry.ends_with("lib/bin.js") { entry.parent()?.parent().map(PathBuf::from) } else { None }
     })
 }
@@ -656,6 +661,16 @@ mod tests {
             assert_eq!(running_version(&probe, managed_port(), None), None);
         }
         assert_eq!(running_version(&FakeSystem { pid: None, command: None }, managed_port(), Some((7, "0.1.0".into()))), None);
+        // A bin link resolves to the package it points at.
+        #[cfg(unix)]
+        {
+            std::fs::write(dir.join("lib/bin.js"), "").unwrap();
+            std::fs::create_dir_all(root.join("bin")).unwrap();
+            std::os::unix::fs::symlink(dir.join("lib/bin.js"), root.join("bin/dsh")).unwrap();
+            let command = format!("node {} --profile web --no-open", root.join("bin/dsh").display());
+            let probe = FakeSystem { pid: Some(7), command: Some(command) };
+            assert_eq!(running_version(&probe, managed_port(), None), Some("0.2.1-alpha.2".into()));
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -36,6 +36,11 @@ use crate::host_exec::{self, ExecError, ExecOutput};
 /// The package this module is allowed to install. Hard-coded, never from a request.
 pub const DSH_PACKAGE: &str = "@deepseek-ai/dsh";
 
+/// The registry every dsh install and lookup asks, passed explicitly so a
+/// configured mirror that has not yet synced a release cannot fail the install
+/// with ETARGET (or report a stale latest).
+pub const DSH_REGISTRY: &str = "https://registry.npmjs.org";
+
 /// Default port `dsh web` listens on, overridable by `DSH_WEB_PORT`.
 pub const DEFAULT_WEB_PORT: u16 = 3080;
 
@@ -73,7 +78,7 @@ impl ServerOpError {
     pub fn message(&self) -> String {
         match self {
             ServerOpError::DshNotInstalledViaPnpm => format!(
-                "dsh is not installed under the pnpm global root; install it with: pnpm add -g {DSH_PACKAGE}"
+                "dsh is not installed under the pnpm global root; install it with: pnpm add -g {DSH_PACKAGE} --registry {DSH_REGISTRY}"
             ),
             ServerOpError::PnpmMissing => "pnpm was not found on PATH".to_string(),
             ServerOpError::PortNotAllowed(p) => format!("port {p} is not managed by this daemon"),
@@ -260,7 +265,7 @@ pub fn validate_update_target(target: &str) -> Result<&str, String> {
 }
 pub fn update_target_args(target: &str) -> Result<Vec<String>, String> {
     validate_update_target(target)?;
-    Ok(vec!["add".to_string(), "-g".to_string(), format!("{DSH_PACKAGE}@{target}")])
+    Ok(vec!["add".into(), "-g".into(), "--registry".into(), DSH_REGISTRY.into(), format!("{DSH_PACKAGE}@{target}")])
 }
 /// The argument vector for updating dsh. Always pnpm, always this package.
 pub fn update_args() -> Vec<String> {
@@ -299,7 +304,7 @@ pub async fn current_version() -> Result<String, ServerOpError> {
 /// A failure is not an error for the caller: being offline is ordinary, and the
 /// UI shows "cannot check" rather than an alarming message.
 pub fn dist_tag_args() -> Vec<String> {
-    vec!["view".into(), DSH_PACKAGE.into(), "dist-tags".into(), "--json".into()]
+    vec!["view".into(), "--registry".into(), DSH_REGISTRY.into(), DSH_PACKAGE.into(), "dist-tags".into(), "--json".into()]
 }
 pub fn parse_dist_tags(text: &str) -> Option<HashMap<String, String>> {
     let values: serde_json::Value = serde_json::from_str(text).ok()?;
@@ -324,7 +329,7 @@ pub fn select_target_version(target: &str, tags: &HashMap<String, String>) -> Op
 pub async fn exact_version(target: &str) -> Option<String> {
     if !is_exact_version(target) { return None; }
     let pnpm = resolve_pnpm().ok()?;
-    let args = vec!["view".into(), format!("{DSH_PACKAGE}@{target}"), "version".into(), "--json".into()];
+    let args = vec!["view".into(), "--registry".into(), DSH_REGISTRY.into(), format!("{DSH_PACKAGE}@{target}"), "version".into(), "--json".into()];
     let out = host_exec::run(&pnpm, &args, None, &HashMap::new(), VIEW_TIMEOUT).await.ok()?;
     if out.exit_code != Some(0) { return None; }
     let version: String = serde_json::from_str(&out.stdout).ok()?;
@@ -495,7 +500,7 @@ mod tests {
     fn update_command_is_pnpm_and_fixed() {
         // The whole argument vector, asserted literally: no caller input reaches
         // it, and it must never become npm.
-        assert_eq!(update_args(), vec!["add", "-g", "@deepseek-ai/dsh@latest"]);
+        assert_eq!(update_args(), vec!["add", "-g", "--registry", "https://registry.npmjs.org", "@deepseek-ai/dsh@latest"]);
         assert!(!update_args().iter().any(|a| a.contains("npm ")));
     }
 

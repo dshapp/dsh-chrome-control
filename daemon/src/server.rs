@@ -53,6 +53,8 @@ pub struct AppState {
     pub host_loopback: bool,
     /// Serializes restart and update so two of either cannot interleave.
     pub host_locks: crate::host_routes::HostLocks,
+    /// The `dsh web` this daemon last started, with the version it was launched as.
+    pub launched_dsh: Arc<std::sync::Mutex<Option<crate::host_server_ops::Launched>>>,
 }
 
 /// Build the router, self-contained. Used by tests, where no one drives the
@@ -87,6 +89,7 @@ pub fn router_with_options(shutdown: Arc<Notify>, host_loopback: bool) -> Router
         host_disabled: Arc::new(AtomicBool::new(false)),
         host_loopback,
         host_locks: crate::host_routes::HostLocks::default(),
+        launched_dsh: Arc::default(),
     };
     Router::new()
         .route("/chrome/mcp", post(mcp_handler))

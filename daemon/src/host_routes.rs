@@ -80,7 +80,12 @@ fn default_target() -> String { "latest".to_string() }
 /// Empty bodies and {} retain the historical latest default; null/extra keys fail closed.
 fn server_target(body: &[u8]) -> Result<String, String> {
     let request = if body.is_empty() { ServerTargetRequest { target: default_target() } }
-        else { serde_json::from_slice::<ServerTargetRequest>(body).map_err(|e| format!("invalid server target request: {e}"))? };
+        else {
+            // Only an object: serde would otherwise read `[]` as a struct with every field defaulted.
+            let value: serde_json::Value = serde_json::from_slice(body).map_err(|e| format!("invalid server target request: {e}"))?;
+            if !value.is_object() { return Err("invalid server target request: expected a JSON object".to_string()); }
+            serde_json::from_value::<ServerTargetRequest>(value).map_err(|e| format!("invalid server target request: {e}"))?
+        };
     ops::validate_update_target(&request.target)?;
     Ok(request.target)
 }

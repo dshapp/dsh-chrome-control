@@ -6,12 +6,12 @@ mod update_channel_tests {
     #[test]
     fn update_targets_are_strict_and_fixed_package() {
         for target in ["latest", "next", "alpha", "1.2.3", "1.2.3-alpha.10+build.01"] {
-            assert_eq!(update_target_args(target).unwrap(), vec!["add", "-g", &format!("@deepseek-ai/dsh@{target}")]);
+            assert_eq!(update_target_args(target).unwrap(), vec!["add", "-g", "--registry", "https://registry.npmjs.org", &format!("@deepseek-ai/dsh@{target}")]);
         }
         for target in ["", "beta", "*", "^1.2.3", "~1.2.3", "1", "1.2", "v1.2.3", "01.2.3", "1.2.3-01", "1.2.3-", "1.2.3+", "1.2.3-a..b", "1.2.3+build..x", "1.2.3 extra", " latest", "latest\n", "@evil/pkg", "latest; touch /tmp/pwn", "--version", "file:/tmp/pkg", "https://evil/pkg"] {
             assert!(update_target_args(target).is_err(), "{target}");
         }
-        assert_eq!(update_args(), vec!["add", "-g", "@deepseek-ai/dsh@latest"]);
+        assert_eq!(update_args(), vec!["add", "-g", "--registry", "https://registry.npmjs.org", "@deepseek-ai/dsh@latest"]);
     }
     #[test]
     fn semver_precedence_and_precision() {
@@ -24,7 +24,7 @@ mod update_channel_tests {
     }
     #[test]
     fn registry_tags_are_filtered_not_sorted_or_substituted() {
-        assert_eq!(dist_tag_args(), vec!["view", "@deepseek-ai/dsh", "dist-tags", "--json"]);
+        assert_eq!(dist_tag_args(), vec!["view", "--registry", "https://registry.npmjs.org", "@deepseek-ai/dsh", "dist-tags", "--json"]);
         let tags = parse_dist_tags(r#"{"latest":"1.0.0","next":"1.1.0-rc.2","alpha":"2.0.0-alpha.10","evil":"99.0.0","bad":"junk"}"#).unwrap();
         assert_eq!(tags.len(), 3);
         assert_eq!(select_target_version("next", &tags), Some("1.1.0-rc.2".into()));

@@ -284,8 +284,50 @@ pub fn web_args(host: &str, port: u16) -> Vec<String> {
     ]
 }
 
-/// Read the installed dsh version, from the copy that will actually be started.
+/// The version of the dsh the user is actually talking to.
+///
+/// The running `dsh web` comes first: after an update without a restart the
+/// installed copy is already new while the server is still the old one, and
+/// reporting the installed version would make the update look applied. Only
+/// when no server can be read does this fall back to the installed copy.
 pub async fn current_version() -> Result<String, ServerOpError> {
+    if let Some(version) = running_version(&RealSystem, managed_port()) {
+        return Ok(version);
+    }
+    installed_version().await
+}
+
+/// The version of the `dsh web` listening on `port`, read from the package its
+/// command line runs (`…/@deepseek-ai/dsh/lib/bin.js`).
+///
+/// `dsh web` publishes no version over HTTP, so the process is the source. A
+/// pnpm install runs a content-addressed directory, so that path keeps naming
+/// the version the process loaded even after an update installs another one.
+/// Bin shims are deliberately not followed: a shim resolves to whatever is
+/// installed *now*, which is the very mistake this avoids.
+pub fn running_version<P: SystemProbe>(probe: &P, port: u16) -> Option<String> {
+    let command = probe.command_of(probe.pid_on_port(port)?)?;
+    if !is_dsh_web_command(&command) {
+        return None;
+    }
+    let dir = dsh_package_dir(&command)?;
+    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("package.json")).ok()?).ok()?;
+    if manifest["name"] != DSH_PACKAGE {
+        return None;
+    }
+    manifest["version"].as_str().filter(|v| is_exact_version(v)).map(str::to_string)
+}
+
+/// The package directory of the `…/lib/bin.js` entry in a command line.
+fn dsh_package_dir(command: &str) -> Option<PathBuf> {
+    command.split_whitespace().find_map(|token| {
+        let entry = std::path::Path::new(token);
+        if entry.ends_with("lib/bin.js") { entry.parent()?.parent().map(PathBuf::from) } else { None }
+    })
+}
+
+/// Read the installed dsh version, from the copy that will actually be started.
+async fn installed_version() -> Result<String, ServerOpError> {
     let dsh = resolve_dsh()?;
     let out = host_exec::run(&dsh, &["--version".to_string()], None, &HashMap::new(), VIEW_TIMEOUT)
         .await
@@ -578,6 +620,25 @@ mod tests {
     fn verify_target_reports_nothing_listening() {
         let probe = FakeSystem { pid: None, command: None };
         assert_eq!(verify_target(&probe, managed_port()), Err(ServerOpError::NotRunning(managed_port())));
+    }
+
+    #[test]
+    fn running_version_reads_the_package_the_process_runs() {
+        let root = std::env::temp_dir().join(format!("dsh-running-version-{}", std::process::id()));
+        let dir = root.join("node_modules/@deepseek-ai/dsh");
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(dir.join("package.json"), r#"{"name":"@deepseek-ai/dsh","version":"0.2.1-alpha.2"}"#).unwrap();
+        let command = format!("/usr/local/bin/node {} web --host 127.0.0.1 --port 3080", dir.join("lib/bin.js").display());
+        assert_eq!(dsh_package_dir(&command), Some(dir.clone()));
+        let probe = FakeSystem { pid: Some(7), command: Some(command) };
+        assert_eq!(running_version(&probe, managed_port()), Some("0.2.1-alpha.2".into()));
+        // Not running, not dsh web, or launched through a shim: no running version.
+        for command in [None, Some("/usr/sbin/httpd".to_string()), Some(PNPM_SHIM_WEB.to_string())] {
+            let probe = FakeSystem { pid: Some(7), command };
+            assert_eq!(running_version(&probe, managed_port()), None);
+        }
+        assert_eq!(running_version(&FakeSystem { pid: None, command: None }, managed_port()), None);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -5,11 +5,15 @@
  * writes a launcher next to it, and registers `com.dsh.chrome` with each
  * Chromium-family browser present. Nobody runs an installer by hand.
  *
- * It serves exactly the two things the store extension cannot do itself:
+ * It serves exactly the things the store extension cannot do itself:
  *
- *   - `start`  — launch `dsh web` when it is not running;
- *   - `cookie` — sign the browser-session login cookie with the secret in
- *                `$DSH_HOME/.credentials.yaml` (the secret never leaves here);
+ *   - `start`     — launch `dsh web` when it is not running;
+ *   - `cookie`    — sign the browser-session login cookie with the secret in
+ *                   `$DSH_HOME/.credentials.yaml` (the secret never leaves here);
+ *   - `filePaths` — the absolute paths of the files/folders on the macOS
+ *                   general (copy) or drag pasteboard. Browsers never expose a
+ *                   pasted or dropped item's real path, so a folder can only be
+ *                   referenced by path through here (read-only);
  *
  * plus a read-only `status` probe for the extension's settings page.
  *
@@ -23,7 +27,7 @@ import path from "node:path";
 import os from "node:os";
 import net from "node:net";
 import crypto from "node:crypto";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const HOST_NAME = "com.dsh.chrome";
@@ -270,10 +274,44 @@ async function status() {
   return {
     ok: true,
     host: HOST_NAME,
-    version: "2.0.0",
+    version: "2.1.0",
     dsh: found ? [launch.command, ...launch.args].join(" ") : null,
     logDir: logDir(),
   };
+}
+
+/**
+ * 剪贴板/拖拽板 → 系统 NSPasteboard 名。只认这两块:扩展粘贴读 general,
+ * 拖放读 drag(macOS 在拖拽开始时写入,松手后保留到下一次拖拽)。
+ */
+const PASTEBOARDS = Object.freeze({ general: "NSPasteboardNameGeneral", drag: "NSPasteboardNameDrag" });
+
+/**
+ * 读某块 pasteboard 上的文件 URL,返回绝对路径。只读,不改 pasteboard。
+ * 用系统自带的 osascript(JXA)调 AppKit,不引入原生依赖;只支持 macOS。
+ */
+function pasteboardFilePaths(board) {
+  if (!Object.hasOwn(PASTEBOARDS, board)) return Promise.resolve({ ok: false, reason: "bad-board" });
+  if (process.platform !== "darwin") return Promise.resolve({ ok: false, reason: "unsupported-platform" });
+  const script = [
+    "ObjC.import('AppKit');",
+    `var pb = $.NSPasteboard.pasteboardWithName($.${PASTEBOARDS[board]});`,
+    "var urls = pb.readObjectsForClassesOptions($.NSArray.arrayWithObject($.NSURL), $({ NSPasteboardURLReadingFileURLsOnlyKey: true }));",
+    "var out = [];",
+    "if (urls) for (var i = 0; i < urls.count; i++) out.push(ObjC.unwrap(urls.objectAtIndex(i).path));",
+    "JSON.stringify(out);",
+  ].join("\n");
+  return new Promise((resolve) => {
+    execFile("/usr/bin/osascript", ["-l", "JavaScript", "-e", script], { timeout: 5000 }, (error, stdout) => {
+      if (error) return resolve({ ok: false, reason: "pasteboard-read-failed" });
+      try {
+        const paths = JSON.parse(String(stdout).trim());
+        resolve({ ok: true, paths: Array.isArray(paths) ? paths.filter((p) => typeof p === "string" && p.startsWith("/")) : [] });
+      } catch {
+        resolve({ ok: false, reason: "pasteboard-read-failed" });
+      }
+    });
+  });
 }
 
 async function dispatch(msg) {
@@ -284,6 +322,7 @@ async function dispatch(msg) {
       return { ok: false, reason: "unknown-target" };
     case "status": return await status();
     case "cookie": return signBrowserSession(msg.host, Number(msg.port));
+    case "filePaths": return await pasteboardFilePaths(msg.board);
     default: return { ok: false, reason: "unknown-cmd" };
   }
 }

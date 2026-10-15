@@ -110,6 +110,24 @@ describe('native host: protocol', () => {
     expect((await host([CALLER], { cmd: 'nope' })).body).toEqual({ ok: false, reason: 'unknown-cmd' })
   })
 
+  it('reads file paths only from the general or drag pasteboard', async () => {
+    expect((await host([CALLER], { cmd: 'filePaths', board: 'find' })).body).toEqual({ ok: false, reason: 'bad-board' })
+    expect((await host([CALLER], { cmd: 'filePaths' })).body).toEqual({ ok: false, reason: 'bad-board' })
+    expect((await host(['chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/'], { cmd: 'filePaths', board: 'general' })).body).toEqual(REFUSED)
+  })
+
+  it.runIf(process.platform === 'darwin')('answers filePaths with absolute paths on macOS (read-only)', async () => {
+    // 读 drag 板而不是 general:测试不去碰用户的剪贴板,内容是什么都行,只核形状。
+    const r = await host([CALLER], { cmd: 'filePaths', board: 'drag' })
+    expect(r.body?.ok).toBe(true)
+    expect(Array.isArray(r.body?.paths)).toBe(true)
+    for (const p of r.body.paths) expect(p.startsWith('/')).toBe(true)
+  })
+
+  it.runIf(process.platform !== 'darwin')('reports filePaths as unsupported off macOS', async () => {
+    expect((await host([CALLER], { cmd: 'filePaths', board: 'general' })).body).toEqual({ ok: false, reason: 'unsupported-platform' })
+  })
+
   it('will not start dsh on a non-loopback host', async () => {
     const r = await host([CALLER], { cmd: 'start', target: 'web', host: '0.0.0.0', port: 3080 })
     expect(r.body).toMatchObject({ ok: false, reason: 'host-not-loopback' })

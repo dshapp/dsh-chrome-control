@@ -63,6 +63,18 @@ $DSH_HOME/native-host/config.json           node + entry of the dsh that booted,
 <browser>/NativeMessagingHosts/com.dsh.chrome.json   for each Chromium-family browser present
 ```
 
+`<browser>` is `~/Library/Application Support/<vendor>` on macOS and
+`$XDG_CONFIG_HOME/<browser>` (default `~/.config`) on **Linux**: `google-chrome`
+(+ `-beta`, `-unstable`), `chromium`, `microsoft-edge` (+ `-beta`, `-dev`),
+`BraveSoftware/Brave-Browser`, `vivaldi` (+ `-snapshot`). Snap/Flatpak browsers
+are confined and cannot execute a host outside their sandbox, so they are not
+targeted. The launcher is POSIX `sh` (no bash assumption), and tries the
+recorded node, then Homebrew/Linuxbrew, `/usr/local`, `/usr/bin`, Volta, snap,
+and finally `node` on `PATH`. On Linux `filePaths` reads `text/uri-list` from the
+clipboard with `wl-paste` (Wayland, package `wl-clipboard`) or `xclip` (X11);
+without either it answers `clipboard-tool-missing`, and like Windows there is no
+drag pasteboard (`unsupported-board`).
+
 On **Windows 10+** Chrome never looks for host manifests in a directory — it
 only reads the registry, which is why a manifest file alone reports "Specified
 native messaging host not found". The layout there is:
@@ -87,7 +99,7 @@ folders); Windows keeps no drag pasteboard, so `board: "drag"` answers
 `unsupported-board`.
 
 Writes are compare-then-rename, so an unchanged boot touches nothing; failures
-are logged and never stop the plugin. macOS, Linux and Windows 10+.
+are logged and never stop the plugin. Supported on macOS, Linux and Windows 10+.
 
 Only `chrome-extension://kgjjicancjnedmappjhefngdjaommpop` may call it, checked
 twice: Chrome enforces the manifest's `allowed_origins`, and the host itself

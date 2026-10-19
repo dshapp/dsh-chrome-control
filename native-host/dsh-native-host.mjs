@@ -11,8 +11,9 @@
  *   - `cookie`    — sign the browser-session login cookie with the secret in
  *                   `$DSH_HOME/.credentials.yaml` (the secret never leaves here);
  *   - `filePaths` — the absolute paths of the files/folders on the macOS
- *                   general (copy) or drag pasteboard, or on the Windows
- *                   clipboard (copy only: Windows keeps no drag pasteboard).
+ *                   general (copy) or drag pasteboard, or on the Windows /
+ *                   Linux clipboard (copy only: neither keeps a drag
+ *                   pasteboard; Linux reads text/uri-list via wl-paste/xclip).
  *                   Browsers never expose a pasted or dropped item's real path,
  *                   so a folder can only be referenced by path through here
  *                   (read-only);
@@ -164,7 +165,10 @@ function resolveDsh() {
     path.join(home, "Library/pnpm/dsh"),
     path.join(home, ".local/share/pnpm/bin/dsh"),
     path.join(home, ".local/share/pnpm/dsh"),
+    path.join(home, ".npm-global/bin/dsh"),
+    path.join(home, ".volta/bin/dsh"),
     "/opt/homebrew/bin/dsh",
+    "/home/linuxbrew/.linuxbrew/bin/dsh",
     path.join(home, ".cargo/bin/dsh"),
     path.join(home, ".local/bin/dsh"),
     "/usr/local/bin/dsh",
@@ -362,13 +366,68 @@ function windowsClipboardFilePaths(board) {
   });
 }
 
+/** PATH(Chrome 继承自桌面会话)里加上常见系统目录,找一个可执行文件;没有就 null。 */
+function findExecutable(name) {
+  const dirs = [...String(process.env.PATH || "").split(path.delimiter), "/usr/bin", "/usr/local/bin", "/bin"];
+  for (const dir of dirs) {
+    if (!dir) continue;
+    const file = path.join(dir, name);
+    try { fs.accessSync(file, fs.constants.X_OK); return file; } catch {}
+  }
+  return null;
+}
+
+/**
+ * text/uri-list(RFC 2483)→ 绝对路径。只认 file: URI;注释行(#)、空行、
+ * 别的 scheme 与带远端主机的 file URI 一律跳过。
+ */
+function parseUriList(text) {
+  const out = [];
+  for (const line of String(text).split(/\r?\n/)) {
+    const uri = line.trim();
+    if (!uri || uri.startsWith("#") || !/^file:/i.test(uri)) continue;
+    try { out.push(fileURLToPath(uri)); } catch {}
+  }
+  return absolutePaths(out);
+}
+
+/**
+ * Linux 剪贴板上的文件/文件夹路径。文件管理器(Nautilus、Dolphin、Thunar…)复制
+ * 文件时都会提供 text/uri-list,这里按会话类型找系统自带的剪贴板工具去读:
+ * Wayland 用 wl-paste(wl-clipboard),X11 用 xclip;XWayland 下两者都试。
+ * 剪贴板里没有这种类型(复制的是文字)= 没有路径,回空列表而不是失败。
+ * Linux 也没有会保留下来的拖拽板,所以 drag 如实回不支持。
+ */
+function linuxClipboardFilePaths(board) {
+  if (board !== "general") return Promise.resolve({ ok: false, reason: "unsupported-board" });
+  const tools = [];
+  if (process.env.WAYLAND_DISPLAY) tools.push({ name: "wl-paste", args: ["--no-newline", "--type", "text/uri-list"] });
+  if (process.env.DISPLAY) tools.push({ name: "xclip", args: ["-selection", "clipboard", "-o", "-t", "text/uri-list"] });
+  if (tools.length === 0) return Promise.resolve({ ok: false, reason: "no-display" });
+  // 「这块剪贴板里没有 uri-list / 是空的」的各家说法:不是错误,只是没有路径。
+  const EMPTY = /no suitable type|not available|nothing is copied|no selection|target .* not available/i;
+  const attempt = (index, missing) => new Promise((resolve) => {
+    if (index >= tools.length) return resolve({ ok: false, reason: missing ? "clipboard-tool-missing" : "pasteboard-read-failed" });
+    const tool = tools[index];
+    const file = findExecutable(tool.name);
+    if (!file) return resolve(attempt(index + 1, missing));
+    execFile(file, tool.args, { timeout: 5000, encoding: "utf8", maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (!error) return resolve({ ok: true, paths: parseUriList(stdout) });
+      if (EMPTY.test(String(stderr))) return resolve({ ok: true, paths: [] });
+      resolve(attempt(index + 1, false));
+    });
+  });
+  return attempt(0, true);
+}
+
 /**
  * 读某块 pasteboard 上的文件 URL,返回绝对路径。只读,不改 pasteboard。
- * macOS 用系统自带的 osascript(JXA)调 AppKit,Windows 见上;都不引入原生依赖。
+ * macOS 用系统自带的 osascript(JXA)调 AppKit,Windows、Linux 见上;都不引入原生依赖。
  */
 function pasteboardFilePaths(board) {
   if (!Object.hasOwn(PASTEBOARDS, board)) return Promise.resolve({ ok: false, reason: "bad-board" });
   if (process.platform === "win32") return windowsClipboardFilePaths(board);
+  if (process.platform === "linux") return linuxClipboardFilePaths(board);
   if (process.platform !== "darwin") return Promise.resolve({ ok: false, reason: "unsupported-platform" });
   const script = [
     "ObjC.import('AppKit');",

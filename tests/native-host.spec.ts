@@ -125,8 +125,51 @@ describe('native host: protocol', () => {
     for (const p of r.body.paths) expect(p.startsWith('/')).toBe(true)
   })
 
-  it.runIf(process.platform === 'linux')('reports filePaths as unsupported on Linux', async () => {
-    expect((await host([CALLER], { cmd: 'filePaths', board: 'general' })).body).toEqual({ ok: false, reason: 'unsupported-platform' })
+  describe.runIf(process.platform === 'linux')('Linux clipboard', () => {
+    /** A bin dir holding fake clipboard tools, each a sh script. */
+    function fakeTools(scripts: Record<string, string>): string {
+      const dir = mkdtempSync(path.join(tmpdir(), 'dsh-clip-'))
+      for (const [name, body] of Object.entries(scripts)) {
+        writeFileSync(path.join(dir, name), '#!/bin/sh\n' + body + '\n', { mode: 0o755 })
+      }
+      return dir
+    }
+    const clip = (bin: string, env: NodeJS.ProcessEnv, board = 'general') =>
+      run(process.execPath, [HOST, CALLER], frame(JSON.stringify({ cmd: 'filePaths', board })), { PATH: bin, HOME: tmpdir(), ...env })
+    // What Nautilus/Dolphin put on the clipboard: CRLF uri-list, percent-encoded.
+    const URIS = "printf 'file:///tmp/a%%20b/\\r\\n# comment\\r\\nfile:///home/u/%%E4%%B8%%AD\\r\\nhttps://example.com/x\\r\\nfile://remote/share\\r\\n'"
+
+    it('reads text/uri-list through wl-paste on Wayland', async () => {
+      const bin = fakeTools({ 'wl-paste': '[ "$2 $3" = "--type text/uri-list" ] || exit 9\n' + URIS })
+      expect((await clip(bin, { WAYLAND_DISPLAY: 'wayland-0' })).body).toEqual({ ok: true, paths: ['/tmp/a b/', '/home/u/中'] })
+    })
+
+    it('reads it through xclip on X11, and falls back to it when wl-paste fails', async () => {
+      const bin = fakeTools({ xclip: URIS, 'wl-paste': 'echo "Failed to connect to a Wayland server" >&2; exit 1' })
+      const expected = { ok: true, paths: ['/tmp/a b/', '/home/u/中'] }
+      expect((await clip(bin, { DISPLAY: ':0' })).body).toEqual(expected)
+      expect((await clip(bin, { DISPLAY: ':0', WAYLAND_DISPLAY: 'wayland-0' })).body).toEqual(expected)
+    })
+
+    it('treats a clipboard without file URIs (copied text) as no paths, not a failure', async () => {
+      const bin = fakeTools({ 'wl-paste': 'echo "No suitable type of content copied" >&2; exit 1' })
+      expect((await clip(bin, { WAYLAND_DISPLAY: 'wayland-0' })).body).toEqual({ ok: true, paths: [] })
+      const x = fakeTools({ xclip: 'echo "Error: target text/uri-list not available" >&2; exit 1' })
+      expect((await clip(x, { DISPLAY: ':0' })).body).toEqual({ ok: true, paths: [] })
+    })
+
+    it('says why it cannot read: no display session, or no clipboard tool installed', async () => {
+      const empty = fakeTools({})
+      expect((await clip(empty, {})).body).toEqual({ ok: false, reason: 'no-display' })
+      // Only meaningful when the machine itself has no wl-paste in the system dirs.
+      if (!['/usr/bin', '/usr/local/bin', '/bin'].some(d => existsSync(path.join(d, 'wl-paste')))) {
+        expect((await clip(empty, { WAYLAND_DISPLAY: 'wayland-0' })).body).toEqual({ ok: false, reason: 'clipboard-tool-missing' })
+      }
+    })
+
+    it('refuses the drag board, which Linux does not keep', async () => {
+      expect((await clip(fakeTools({}), { DISPLAY: ':0' }, 'drag')).body).toEqual({ ok: false, reason: 'unsupported-board' })
+    })
   })
 
   it.runIf(process.platform === 'win32')('reads the Windows clipboard, and refuses the drag board Windows does not keep', async () => {
@@ -226,6 +269,38 @@ describe('installNativeHost', () => {
     const r = installNativeHost({ ...opts, hostSource: '/nonexistent/host.mjs' })
     expect(r.installed).toBe(false)
     expect(r.reason).toBeTruthy()
+  })
+
+  it('registers on Linux under $XDG_CONFIG_HOME for each browser present', () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'dsh-nmh-linux-'))
+    const config = path.join(home, 'xdg')
+    mkdirSync(path.join(config, 'google-chrome'), { recursive: true })
+    mkdirSync(path.join(config, 'microsoft-edge'), { recursive: true })
+    const r = installNativeHost({
+      home, dshHome: path.join(home, '.dsh'), platform: 'linux', node: process.execPath, dshEntry: '/x/bin.js',
+      env: { XDG_CONFIG_HOME: config },
+    })
+    expect(r.browsers).toEqual([path.join(config, 'google-chrome'), path.join(config, 'microsoft-edge')])
+    const manifest = JSON.parse(readFileSync(path.join(config, 'google-chrome', 'NativeMessagingHosts', 'com.dsh.chrome.json'), 'utf8'))
+    expect(manifest.path).toBe(path.join(home, '.dsh', 'native-host', 'dsh-native-host'))
+    expect(existsSync(path.join(home, '.config'))).toBe(false)
+    expect(browserDirs('linux', '/h', {})).toContain('/h/.config/google-chrome-unstable')
+  })
+
+  it('writes a POSIX sh launcher that falls back to node on PATH', () => {
+    const script = launcherScript('/gone/node', '/h/x.mjs', '/h')
+    expect(script.startsWith('#!/bin/sh\n')).toBe(true)
+    expect(script).toContain('/home/linuxbrew/.linuxbrew/bin/node')
+    expect(script).toContain('NODE=$(command -v node 2>/dev/null) && [ -x "$NODE" ] && exec "$NODE" "$HOST" "$@"')
+  })
+
+  it.skipIf(process.platform === 'win32')('the launcher still starts when the recorded node is gone, via PATH', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'dsh-nmh-path-'))
+    const launcher = path.join(dir, 'launcher')
+    writeFileSync(launcher, launcherScript('/gone/node', HOST, dir), { mode: 0o755 })
+    // Only the running node's directory on PATH: none of the fixed candidates is assumed to exist.
+    const r = await run(launcher, [CALLER], frame('{"cmd":"status"}'), { PATH: path.dirname(process.execPath) + ':/usr/bin:/bin' })
+    expect(r.body?.ok).toBe(true)
   })
 
   it('ships the host where the built plugin looks for it', () => {

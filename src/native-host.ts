@@ -4,8 +4,9 @@
  *
  *   - start `dsh web` when it is not running;
  *   - obtain the signed browser-session login cookie;
- *   - read the absolute paths on the macOS copy/drag pasteboard (a pasted or
- *     dropped folder is referenced by path; browsers never expose it).
+ *   - read the absolute paths on the copy/drag pasteboard (macOS) or the
+ *     clipboard (Windows, Linux) — a pasted or dropped folder is referenced by
+ *     path; browsers never expose it.
  *
  * Nothing else is installed. The extension comes from the Chrome Web Store;
  * this only lays down what the extension needs on the machine side.
@@ -20,7 +21,8 @@
  * plus the browser-side registration:
  *
  *   - macOS / Linux: `<browser>/NativeMessagingHosts/com.dsh.chrome.json` for
- *     every Chromium-family browser directory that exists;
+ *     every Chromium-family browser directory that exists (`~/Library/Application
+ *     Support/…` on macOS, `$XDG_CONFIG_HOME` — default `~/.config` — on Linux);
  *   - Windows: `$DSH_HOME/native-host/com.dsh.chrome.json`, pointed at by the
  *     default value of `HKCU\Software\<vendor>\NativeMessagingHosts\com.dsh.chrome`.
  *     Windows Chrome never scans a directory for host manifests — it only reads
@@ -118,7 +120,7 @@ export function defaultHostSource(): string {
 }
 
 /** Chromium-family user-data directories that own a `NativeMessagingHosts/`. */
-export function browserDirs(platform: NodeJS.Platform, home: string): string[] {
+export function browserDirs(platform: NodeJS.Platform, home: string, env: NodeJS.ProcessEnv = process.env): string[] {
   if (platform === 'darwin') {
     const s = path.join(home, 'Library', 'Application Support')
     return [
@@ -126,10 +128,14 @@ export function browserDirs(platform: NodeJS.Platform, home: string): string[] {
       'Microsoft Edge', 'BraveSoftware/Brave-Browser', 'Vivaldi',
     ].map(d => path.join(s, d))
   }
-  const c = process.env.XDG_CONFIG_HOME || path.join(home, '.config')
+  // Linux: per-user hosts live under $XDG_CONFIG_HOME/<browser>/NativeMessagingHosts.
+  // Snap/Flatpak builds are confined and cannot execute a host outside their
+  // sandbox, so they are deliberately not targeted.
+  const c = env.XDG_CONFIG_HOME || path.join(home, '.config')
   return [
-    'google-chrome', 'google-chrome-beta', 'chromium', 'microsoft-edge',
-    'BraveSoftware/Brave-Browser', 'vivaldi',
+    'google-chrome', 'google-chrome-beta', 'google-chrome-unstable', 'chromium',
+    'microsoft-edge', 'microsoft-edge-beta', 'microsoft-edge-dev',
+    'BraveSoftware/Brave-Browser', 'vivaldi', 'vivaldi-snapshot',
   ].map(d => path.join(c, d))
 }
 
@@ -255,22 +261,27 @@ function sh(value: string): string {
 }
 
 /**
- * The launcher Chrome executes. Chrome starts it with a minimal PATH, so node
- * is absolute: the running dsh's node first, then the usual stable symlinks
- * (a Homebrew upgrade deletes the versioned Cellar path recorded earlier).
+ * The launcher Chrome executes (macOS and Linux). Chrome starts it with a
+ * minimal PATH, so node is absolute: the running dsh's node first, then the
+ * usual stable locations — Homebrew/Linuxbrew, /usr/local, distro packages,
+ * Volta's shim, snap — because an upgrade deletes the versioned path recorded
+ * earlier (Homebrew's Cellar, nvm's versions/). Only then whatever `node` the
+ * inherited PATH has. Plain POSIX sh: /bin/bash is not guaranteed on Linux
+ * (NixOS has none), /bin/sh is.
  *
  * `"$@"` is load-bearing: Chrome passes the caller's origin as the first
  * argument, and the host refuses every caller it cannot see.
  */
 export function launcherScript(node: string, hostFile: string, dshHome: string): string {
   return [
-    '#!/bin/bash',
+    '#!/bin/sh',
     '# Written by dsh-chrome-control on every dsh boot; edits are overwritten.',
     `export DSH_HOME=${sh(dshHome)}`,
     `HOST=${sh(hostFile)}`,
-    `for NODE in ${sh(node)} /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node; do`,
+    `for NODE in ${sh(node)} /opt/homebrew/bin/node /home/linuxbrew/.linuxbrew/bin/node /usr/local/bin/node /usr/bin/node "$HOME/.volta/bin/node" /snap/bin/node; do`,
     '  [ -x "$NODE" ] && exec "$NODE" "$HOST" "$@"',
     'done',
+    'NODE=$(command -v node 2>/dev/null) && [ -x "$NODE" ] && exec "$NODE" "$HOST" "$@"',
     'echo "dsh-native-host: node not found" >&2',
     'exit 127',
     '',
@@ -360,7 +371,7 @@ export function installNativeHost(options: InstallOptions = {}): InstallResult {
       const launcher = path.join(dir, 'dsh-native-host')
       writeIfChanged(launcher, launcherScript(node, hostFile, dshHome), 0o755, result.changed)
       const manifest = hostManifest(launcher)
-      for (const browser of browserDirs(platform, home)) {
+      for (const browser of browserDirs(platform, home, options.env ?? process.env)) {
         if (!existsSync(browser)) continue
         writeIfChanged(path.join(browser, 'NativeMessagingHosts', `${NATIVE_HOST_NAME}.json`), manifest, 0o644, result.changed)
         result.browsers.push(browser)

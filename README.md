@@ -78,6 +78,13 @@ loopback host.
   which is also the extension's default bridge address
   (`ws://127.0.0.1:37086/chrome/ws`). It is detached, so it survives `dsh web`
   restarts; stop it with `kill -TERM <pid>`.
+- **Daemon log: `$DSH_HOME/logs/chrome-daemon.log`.** The daemon's stdout and
+  stderr go to this file (appended; rotated to `.1` past 5 MiB at the next
+  spawn), never to pipes into `dsh web`: a pipe dies with the `dsh web` that
+  spawned it, while the daemon lives on. The daemon itself also treats a dead
+  log destination as harmless. It once was not — a failed log write panicked
+  the extension's socket task, after which the extension showed as
+  disconnected and every tool call timed out.
 - **Startup order does not matter.** The bridge is loaded with
   `failOnStartupError: false` and its own reconnect policy; the extension may
   attach at any time.

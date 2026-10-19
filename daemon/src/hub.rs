@@ -46,7 +46,7 @@ impl DispatchOutcome {
     }
 }
 
-type Outbound = Arc<dyn Fn(&ServerFrame) -> bool + Send + Sync>;
+pub type Outbound = Arc<dyn Fn(&ServerFrame) -> bool + Send + Sync>;
 
 struct Waiter {
     settle: oneshot::Sender<DispatchOutcome>,

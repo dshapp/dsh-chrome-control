@@ -284,7 +284,7 @@ describe('installNativeHost', () => {
     const manifest = JSON.parse(readFileSync(path.join(config, 'google-chrome', 'NativeMessagingHosts', 'com.dsh.chrome.json'), 'utf8'))
     expect(manifest.path).toBe(path.join(home, '.dsh', 'native-host', 'dsh-native-host'))
     expect(existsSync(path.join(home, '.config'))).toBe(false)
-    expect(browserDirs('linux', '/h', {})).toContain('/h/.config/google-chrome-unstable')
+    expect(browserDirs('linux', '/h', {})).toContain(path.join('/h', '.config', 'google-chrome-unstable'))
   })
 
   it('writes a POSIX sh launcher that falls back to node on PATH', () => {

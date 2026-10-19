@@ -315,8 +315,12 @@ describe('installNativeHost on Windows', () => {
   })
 
   it.runIf(process.platform === 'win32')('installs a launcher cmd.exe runs the way Chrome starts it, forwarding the caller', async () => {
-    const { dshHome, opts } = sandbox()
-    installNativeHost({ ...opts, node: process.execPath, env: process.env })
+    const { home, dshHome, opts } = sandbox()
+    // A real entry file: the host only trusts a recorded launch whose files exist.
+    const dshEntry = path.join(home, 'fake-dsh', 'bin.js')
+    mkdirSync(path.dirname(dshEntry), { recursive: true })
+    writeFileSync(dshEntry, '')
+    installNativeHost({ ...opts, node: process.execPath, dshEntry, env: process.env })
     const launcher = path.join(dshHome, 'native-host', 'dsh-native-host.cmd')
     // Chrome: cmd.exe /d /s /c ""<launcher>" <origin> --parent-window=<hwnd>"
     const viaChrome = (caller: string) => run(process.env.ComSpec || 'cmd.exe',
@@ -324,7 +328,7 @@ describe('installNativeHost on Windows', () => {
       frame(JSON.stringify({ cmd: 'status' })), process.env, true)
     const ok = await viaChrome(CALLER)
     expect(ok.body?.ok).toBe(true)
-    expect(ok.body?.dsh).toBe(process.execPath + ' ' + opts.dshEntry)
+    expect(ok.body?.dsh).toBe(process.execPath + ' ' + dshEntry)
     // DSH_HOME came from the launcher's own directory.
     expect(ok.body?.logDir.toLowerCase()).toBe(path.join(dshHome, 'logs', 'chrome-native-host').toLowerCase())
     expect((await viaChrome('chrome-extension://' + OLD_DEV_ID + '/')).body).toEqual(REFUSED)

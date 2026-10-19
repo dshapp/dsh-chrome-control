@@ -89,7 +89,7 @@ function resolveBinary(): string | undefined {
     // dev: built beside the plugin
     path.resolve(here, '..', 'daemon', 'target', 'release', EXE),
     // legacy install dir
-    path.resolve(process.env.HOME ?? '', '.dsh-chrome', 'bin', EXE),
+    path.resolve(homedir(), '.dsh-chrome', 'bin', EXE),
   ]
   return candidates.find(p => existsSync(p))
 }
@@ -253,6 +253,8 @@ function startDaemon(log: Context['logger']): void {
       // Own process group: a group-wide signal to `dsh web` (Ctrl-C, SIGHUP) must
       // not reach the daemon, and it outlives the parent as an orphan (PPID 1).
       detached: true,
+      // Windows: no console window for a background service.
+      windowsHide: true,
       // Never 'pipe': see openDaemonLog for what a pipe to a dead parent did.
       stdio: ['ignore', output.fd, output.fd],
     })

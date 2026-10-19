@@ -11,9 +11,12 @@
  *   - `cookie`    — sign the browser-session login cookie with the secret in
  *                   `$DSH_HOME/.credentials.yaml` (the secret never leaves here);
  *   - `filePaths` — the absolute paths of the files/folders on the macOS
- *                   general (copy) or drag pasteboard. Browsers never expose a
- *                   pasted or dropped item's real path, so a folder can only be
- *                   referenced by path through here (read-only);
+ *                   general (copy) or drag pasteboard, or on the Windows /
+ *                   Linux clipboard (copy only: neither keeps a drag
+ *                   pasteboard; Linux reads text/uri-list via wl-paste/xclip).
+ *                   Browsers never expose a pasted or dropped item's real path,
+ *                   so a folder can only be referenced by path through here
+ *                   (read-only);
  *
  * plus a read-only `status` probe for the extension's settings page.
  *
@@ -142,13 +145,30 @@ function resolveLaunch() {
 function resolveDsh() {
   const home = os.homedir();
   const pnpmHome = process.env.PNPM_HOME;
+  if (process.platform === "win32") {
+    // npm/pnpm 在 Windows 上装的是 dsh.cmd 垫片;spawn 它要走 cmd(见 spawnSpec)。
+    const appData = process.env.APPDATA || path.join(home, "AppData", "Roaming");
+    const localAppData = process.env.LOCALAPPDATA || path.join(home, "AppData", "Local");
+    const candidates = [
+      pnpmHome && path.join(pnpmHome, "dsh.cmd"),
+      path.join(localAppData, "pnpm", "dsh.cmd"),
+      path.join(appData, "npm", "dsh.cmd"),
+      process.env.ProgramFiles && path.join(process.env.ProgramFiles, "nodejs", "dsh.cmd"),
+      path.join(home, ".cargo", "bin", "dsh.exe"),
+    ];
+    for (const c of candidates) if (c && fs.existsSync(c)) return c;
+    return "dsh";
+  }
   const candidates = [
     pnpmHome && path.join(pnpmHome, "dsh"),
     path.join(home, "Library/pnpm/bin/dsh"),
     path.join(home, "Library/pnpm/dsh"),
     path.join(home, ".local/share/pnpm/bin/dsh"),
     path.join(home, ".local/share/pnpm/dsh"),
+    path.join(home, ".npm-global/bin/dsh"),
+    path.join(home, ".volta/bin/dsh"),
     "/opt/homebrew/bin/dsh",
+    "/home/linuxbrew/.linuxbrew/bin/dsh",
     path.join(home, ".cargo/bin/dsh"),
     path.join(home, ".local/bin/dsh"),
     "/usr/local/bin/dsh",
@@ -209,11 +229,13 @@ function readMessage() {
     process.stdin.on("end", () => resolve(null));
   });
 }
+/// 写一帧,等它真正交给系统再返回:Windows 上管道的 stdout 是异步写,只靠
+/// 退出前的 sleep 不能保证帧已离开进程。
 function writeMessage(obj) {
   const json = Buffer.from(JSON.stringify(obj), "utf8");
   const header = Buffer.alloc(4);
   header.writeUInt32LE(json.length, 0);
-  process.stdout.write(Buffer.concat([header, json]));
+  return new Promise((resolve) => process.stdout.write(Buffer.concat([header, json]), () => resolve()));
 }
 
 function probePort(port, host, timeoutMs) {
@@ -241,6 +263,22 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /** 只替扩展在环回上起 server:host 来自扩展设置,不能借它把 dsh 绑到网卡上。 */
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 
+/**
+ * spawn 的参数。Windows 上 .cmd/.bat 垫片(以及只剩裸名 "dsh" 时的 PATH 查找)
+ * 不能直接 CreateProcess —— Node 自 CVE-2024-27980 起会直接报 EINVAL —— 只能经
+ * cmd 解释,于是命令行由这里自己拼:路径整体加引号,其余参数都是本文件生成的
+ * 固定串(host 已核过是环回、port 已核过是整数),没有可注入的东西。
+ * windowsHide:不让 dsh web 弹出一个控制台窗口。
+ */
+function spawnSpec(command, args) {
+  const options = { windowsHide: true };
+  if (process.platform === "win32" && (/\.(cmd|bat)$/i.test(command) || !path.isAbsolute(command))) {
+    const quote = (value) => (/[\s"&|<>^()]/.test(value) ? `"${value}"` : value);
+    return { command: [command, ...args].map(quote).join(" "), args: [], options: { ...options, shell: true } };
+  }
+  return { command, args, options };
+}
+
 async function startWeb(opts) {
   const host = opts.host || "127.0.0.1";
   const port = Number(opts.port) || 3080;
@@ -253,7 +291,9 @@ async function startWeb(opts) {
   try { logFd = fs.openSync(logPath, "a"); } catch {}
   const out = logFd != null ? logFd : "ignore";
   const err = logFd != null ? logFd : "ignore";
-  const child = spawn(launch.command, [...launch.args, "web", "--no-open", "--host", String(host), "--port", String(port)], {
+  const spec = spawnSpec(launch.command, [...launch.args, "web", "--no-open", "--host", String(host), "--port", String(port)]);
+  const child = spawn(spec.command, spec.args, {
+    ...spec.options,
     detached: true,
     stdio: ["ignore", out, err],
     cwd: os.homedir(),
@@ -286,12 +326,108 @@ async function status() {
  */
 const PASTEBOARDS = Object.freeze({ general: "NSPasteboardNameGeneral", drag: "NSPasteboardNameDrag" });
 
+/** 只留绝对路径:pasteboard 上不该有相对路径,有也不能当真。 */
+function absolutePaths(paths) {
+  return Array.isArray(paths) ? paths.filter((p) => typeof p === "string" && path.isAbsolute(p)) : [];
+}
+
+/**
+ * Windows 剪贴板(CF_HDROP)上的文件/文件夹路径。用系统自带的 Windows PowerShell
+ * 调 System.Windows.Forms.Clipboard(要 STA),不引入原生依赖。脚本走
+ * -EncodedCommand,免得 cmd/PowerShell 两层引号;结果是 UTF-8 JSON 再转 base64 ——
+ * 输出只剩 ASCII,非 ASCII 路径(中文用户名、中文文件夹)就不会被 OEM 代码页
+ * 弄坏,也不必去改控制台编码(宿主没有可见控制台时那一步本身可能失败)。
+ * Windows 没有像 macOS 那样会保留下来的拖拽板,所以 drag 如实回不支持。
+ */
+function windowsClipboardFilePaths(board) {
+  if (board !== "general") return Promise.resolve({ ok: false, reason: "unsupported-board" });
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    "Add-Type -AssemblyName System.Windows.Forms",
+    "$list = @([System.Windows.Forms.Clipboard]::GetFileDropList())",
+    "$json = ConvertTo-Json -Compress -InputObject $list",
+    "[Console]::Out.Write([Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json)))",
+  ].join("; ");
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  const root = process.env.SystemRoot || process.env.windir || "C:\\Windows";
+  const powershell = path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  return new Promise((resolve) => {
+    execFile(powershell, ["-NoProfile", "-NonInteractive", "-STA", "-EncodedCommand", encoded],
+      { timeout: 10000, windowsHide: true, encoding: "utf8" }, (error, stdout) => {
+        if (error) return resolve({ ok: false, reason: "pasteboard-read-failed" });
+        try {
+          const json = Buffer.from(String(stdout).trim(), "base64").toString("utf8");
+          const parsed = JSON.parse(json || "[]");
+          resolve({ ok: true, paths: absolutePaths(Array.isArray(parsed) ? parsed : [parsed]) });
+        } catch {
+          resolve({ ok: false, reason: "pasteboard-read-failed" });
+        }
+      });
+  });
+}
+
+/** PATH(Chrome 继承自桌面会话)里加上常见系统目录,找一个可执行文件;没有就 null。 */
+function findExecutable(name) {
+  const dirs = [...String(process.env.PATH || "").split(path.delimiter), "/usr/bin", "/usr/local/bin", "/bin"];
+  for (const dir of dirs) {
+    if (!dir) continue;
+    const file = path.join(dir, name);
+    try { fs.accessSync(file, fs.constants.X_OK); return file; } catch {}
+  }
+  return null;
+}
+
+/**
+ * text/uri-list(RFC 2483)→ 绝对路径。只认 file: URI;注释行(#)、空行、
+ * 别的 scheme 与带远端主机的 file URI 一律跳过。
+ */
+function parseUriList(text) {
+  const out = [];
+  for (const line of String(text).split(/\r?\n/)) {
+    const uri = line.trim();
+    if (!uri || uri.startsWith("#") || !/^file:/i.test(uri)) continue;
+    try { out.push(fileURLToPath(uri)); } catch {}
+  }
+  return absolutePaths(out);
+}
+
+/**
+ * Linux 剪贴板上的文件/文件夹路径。文件管理器(Nautilus、Dolphin、Thunar…)复制
+ * 文件时都会提供 text/uri-list,这里按会话类型找系统自带的剪贴板工具去读:
+ * Wayland 用 wl-paste(wl-clipboard),X11 用 xclip;XWayland 下两者都试。
+ * 剪贴板里没有这种类型(复制的是文字)= 没有路径,回空列表而不是失败。
+ * Linux 也没有会保留下来的拖拽板,所以 drag 如实回不支持。
+ */
+function linuxClipboardFilePaths(board) {
+  if (board !== "general") return Promise.resolve({ ok: false, reason: "unsupported-board" });
+  const tools = [];
+  if (process.env.WAYLAND_DISPLAY) tools.push({ name: "wl-paste", args: ["--no-newline", "--type", "text/uri-list"] });
+  if (process.env.DISPLAY) tools.push({ name: "xclip", args: ["-selection", "clipboard", "-o", "-t", "text/uri-list"] });
+  if (tools.length === 0) return Promise.resolve({ ok: false, reason: "no-display" });
+  // 「这块剪贴板里没有 uri-list / 是空的」的各家说法:不是错误,只是没有路径。
+  const EMPTY = /no suitable type|not available|nothing is copied|no selection|target .* not available/i;
+  const attempt = (index, missing) => new Promise((resolve) => {
+    if (index >= tools.length) return resolve({ ok: false, reason: missing ? "clipboard-tool-missing" : "pasteboard-read-failed" });
+    const tool = tools[index];
+    const file = findExecutable(tool.name);
+    if (!file) return resolve(attempt(index + 1, missing));
+    execFile(file, tool.args, { timeout: 5000, encoding: "utf8", maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (!error) return resolve({ ok: true, paths: parseUriList(stdout) });
+      if (EMPTY.test(String(stderr))) return resolve({ ok: true, paths: [] });
+      resolve(attempt(index + 1, false));
+    });
+  });
+  return attempt(0, true);
+}
+
 /**
  * 读某块 pasteboard 上的文件 URL,返回绝对路径。只读,不改 pasteboard。
- * 用系统自带的 osascript(JXA)调 AppKit,不引入原生依赖;只支持 macOS。
+ * macOS 用系统自带的 osascript(JXA)调 AppKit,Windows、Linux 见上;都不引入原生依赖。
  */
 function pasteboardFilePaths(board) {
   if (!Object.hasOwn(PASTEBOARDS, board)) return Promise.resolve({ ok: false, reason: "bad-board" });
+  if (process.platform === "win32") return windowsClipboardFilePaths(board);
+  if (process.platform === "linux") return linuxClipboardFilePaths(board);
   if (process.platform !== "darwin") return Promise.resolve({ ok: false, reason: "unsupported-platform" });
   const script = [
     "ObjC.import('AppKit');",
@@ -306,7 +442,7 @@ function pasteboardFilePaths(board) {
       if (error) return resolve({ ok: false, reason: "pasteboard-read-failed" });
       try {
         const paths = JSON.parse(String(stdout).trim());
-        resolve({ ok: true, paths: Array.isArray(paths) ? paths.filter((p) => typeof p === "string" && p.startsWith("/")) : [] });
+        resolve({ ok: true, paths: absolutePaths(paths) });
       } catch {
         resolve({ ok: false, reason: "pasteboard-read-failed" });
       }
@@ -330,14 +466,14 @@ async function dispatch(msg) {
 // 调用方不对:不读帧、不碰密钥、不拉进程,只回一条结构化拒绝就退出。放在
 // readMessage 之前,是为了让被拒的调用方连解析路径都走不到。
 if (!callerAllowed(process.argv.slice(2))) {
-  writeMessage({ ok: false, reason: "caller-not-allowed" });
+  await writeMessage({ ok: false, reason: "caller-not-allowed" });
   await sleep(50);
   process.exit(0);
 }
 
 const msg = await readMessage();
 if (msg === MALFORMED_FRAME) {
-  writeMessage({ ok: false, reason: "bad-message" });
+  await writeMessage({ ok: false, reason: "bad-message" });
   await sleep(50);
   process.exit(0);
 }
@@ -345,7 +481,7 @@ if (msg != null) {
   let result;
   try { result = await dispatch(msg); }
   catch (e) { result = { ok: false, reason: String((e && e.message) || e) }; }
-  writeMessage(result);
+  await writeMessage(result);
   await sleep(50);
   process.exit(0);
 }

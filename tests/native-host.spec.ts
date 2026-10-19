@@ -13,6 +13,7 @@ import * as path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   EXTENSION_ID, NATIVE_HOST_NAME, browserDirs, defaultHostSource, installNativeHost, launcherScript,
+  parseRegDefault, windowsBrowsers, windowsLauncherScript, type Registry,
 } from '../src/native-host.ts'
 
 const ROOT = path.resolve(import.meta.dirname, '..')
@@ -31,9 +32,9 @@ function frame(text: string): Buffer {
 interface HostReply { code: number | null; body: any; stderr: string }
 
 /** Run a command the way Chrome does: argv, one frame in, one frame out. */
-function run(command: string, args: string[], payload: Buffer, env: NodeJS.ProcessEnv = process.env): Promise<HostReply> {
+function run(command: string, args: string[], payload: Buffer, env: NodeJS.ProcessEnv = process.env, verbatim = false): Promise<HostReply> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'], env })
+    const child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'], env, windowsVerbatimArguments: verbatim })
     let out = Buffer.alloc(0)
     let stderr = ''
     child.stdout.on('data', (c: Buffer) => { out = Buffer.concat([out, c]) })
@@ -124,8 +125,15 @@ describe('native host: protocol', () => {
     for (const p of r.body.paths) expect(p.startsWith('/')).toBe(true)
   })
 
-  it.runIf(process.platform !== 'darwin')('reports filePaths as unsupported off macOS', async () => {
+  it.runIf(process.platform === 'linux')('reports filePaths as unsupported on Linux', async () => {
     expect((await host([CALLER], { cmd: 'filePaths', board: 'general' })).body).toEqual({ ok: false, reason: 'unsupported-platform' })
+  })
+
+  it.runIf(process.platform === 'win32')('reads the Windows clipboard, and refuses the drag board Windows does not keep', async () => {
+    expect((await host([CALLER], { cmd: 'filePaths', board: 'drag' })).body).toEqual({ ok: false, reason: 'unsupported-board' })
+    const r = await host([CALLER], { cmd: 'filePaths', board: 'general' })
+    expect(r.body?.ok).toBe(true)
+    for (const p of r.body.paths) expect(path.isAbsolute(p)).toBe(true)
   })
 
   it('will not start dsh on a non-loopback host', async () => {
@@ -157,7 +165,8 @@ describe('installNativeHost', () => {
     return { home, dshHome, chrome, dshEntry, opts }
   }
 
-  it('lays down host, launcher, config, and a manifest for each present browser', () => {
+  // POSIX layout (an exec bit, a bash launcher): checked where it can run.
+  it.skipIf(process.platform === 'win32')('lays down host, launcher, config, and a manifest for each present browser', () => {
     const { dshHome, chrome, dshEntry, opts } = sandbox()
     const r = installNativeHost(opts)
     expect(r.installed).toBe(true)
@@ -193,7 +202,7 @@ describe('installNativeHost', () => {
     expect(r.changed).toEqual([path.join(opts.dshHome, 'native-host', 'config.json')])
   })
 
-  it('installs a launcher Chrome can actually run, and that forwards the caller', async () => {
+  it.skipIf(process.platform === 'win32')('installs a launcher Chrome can actually run, and that forwards the caller', async () => {
     const { dshHome, opts } = sandbox()
     installNativeHost(opts)
     const launcher = path.join(dshHome, 'native-host', 'dsh-native-host')
@@ -211,8 +220,8 @@ describe('installNativeHost', () => {
     expect(script).toMatch(/exec "\$NODE" "\$HOST" "\$@"/)
   })
 
-  it('does nothing on Windows and never throws on failure', () => {
-    expect(installNativeHost({ platform: 'win32' })).toMatchObject({ installed: false })
+  it('skips unsupported platforms and never throws on failure', () => {
+    expect(installNativeHost({ platform: 'freebsd' })).toMatchObject({ installed: false })
     const { opts } = sandbox()
     const r = installNativeHost({ ...opts, hostSource: '/nonexistent/host.mjs' })
     expect(r.installed).toBe(false)
@@ -222,5 +231,158 @@ describe('installNativeHost', () => {
   it('ships the host where the built plugin looks for it', () => {
     expect(existsSync(defaultHostSource())).toBe(true)
     expect(browserDirs('linux', '/h')[0]).toMatch(/google-chrome$/)
+  })
+})
+
+describe('installNativeHost on Windows', () => {
+  /** An in-memory HKCU that records every write. */
+  function fakeRegistry(initial: Record<string, string> = {}) {
+    const values = new Map(Object.entries(initial))
+    const writes: string[] = []
+    const registry: Registry = {
+      get: key => values.get(key),
+      set: (key, value) => { values.set(key, value); writes.push(key) },
+    }
+    return { registry, values, writes }
+  }
+
+  function sandbox(initial: Record<string, string> = {}) {
+    const home = mkdtempSync(path.join(tmpdir(), 'dsh-nmh-win-'))
+    const dshHome = path.join(home, '.dsh')
+    const localAppData = path.join(home, 'AppData', 'Local')
+    // Edge present; Chrome's user data deliberately absent (its key is written anyway).
+    mkdirSync(path.join(localAppData, 'Microsoft', 'Edge', 'User Data'), { recursive: true })
+    const reg = fakeRegistry(initial)
+    const opts = {
+      home, dshHome, localAppData, platform: 'win32' as const, registry: reg.registry,
+      node: 'C:\\Program Files\\nodejs\\node.exe', dshEntry: 'C:\\dsh\\bin.js',
+      env: { ProgramFiles: 'C:\\Program Files' },
+    }
+    return { home, dshHome, localAppData, opts, ...reg }
+  }
+
+  const CHROME_KEY = 'HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\' + NATIVE_HOST_NAME
+  const EDGE_KEY = 'HKCU\\Software\\Microsoft\\Edge\\NativeMessagingHosts\\' + NATIVE_HOST_NAME
+
+  it('writes host, .cmd launcher and manifest, and points HKCU at the manifest', () => {
+    const { dshHome, opts, values } = sandbox()
+    const r = installNativeHost(opts)
+    expect(r.installed).toBe(true)
+    // Chrome always; Edge because its user data exists; Chromium/Brave absent.
+    expect(r.browsers).toEqual([CHROME_KEY, EDGE_KEY])
+
+    const dir = path.join(dshHome, 'native-host')
+    const manifestFile = path.join(dir, NATIVE_HOST_NAME + '.json')
+    expect(values.get(CHROME_KEY)).toBe(manifestFile)
+    expect(values.get(EDGE_KEY)).toBe(manifestFile)
+    expect(values.size).toBe(2)
+
+    expect(readFileSync(path.join(dir, 'dsh-native-host.mjs'), 'utf8')).toBe(readFileSync(HOST, 'utf8'))
+    expect(readFileSync(path.join(dir, 'dsh-native-host.cmd'), 'utf8')).toContain('%~dp0dsh-native-host.mjs')
+    const manifest = JSON.parse(readFileSync(manifestFile, 'utf8'))
+    expect(manifest).toMatchObject({
+      name: NATIVE_HOST_NAME,
+      type: 'stdio',
+      path: path.join(dir, 'dsh-native-host.cmd'),
+      allowed_origins: ['chrome-extension://' + EXTENSION_ID + '/'],
+    })
+    // No POSIX launcher on Windows.
+    expect(existsSync(path.join(dir, 'dsh-native-host'))).toBe(false)
+  })
+
+  it('is idempotent: a second boot rewrites no file and no registry value', () => {
+    const { opts, writes } = sandbox()
+    installNativeHost(opts)
+    const before = writes.length
+    const again = installNativeHost(opts)
+    expect(again.changed).toEqual([])
+    expect(writes.length).toBe(before)
+  })
+
+  it('repairs a key that points somewhere else (an older or a hand-made install)', () => {
+    const { opts, writes } = sandbox({ [CHROME_KEY]: 'C:\\old\\com.dsh.chrome.json' })
+    const r = installNativeHost(opts)
+    expect(r.changed).toContain(CHROME_KEY)
+    expect(writes).toContain(CHROME_KEY)
+  })
+
+  it('reports a registry failure without throwing', () => {
+    const { opts } = sandbox()
+    const registry: Registry = { get: () => undefined, set: () => { throw new Error('reg.exe: access denied') } }
+    const r = installNativeHost({ ...opts, registry })
+    expect(r.installed).toBe(false)
+    expect(r.reason).toContain('access denied')
+  })
+
+  it.runIf(process.platform === 'win32')('installs a launcher cmd.exe runs the way Chrome starts it, forwarding the caller', async () => {
+    const { dshHome, opts } = sandbox()
+    installNativeHost({ ...opts, node: process.execPath, env: process.env })
+    const launcher = path.join(dshHome, 'native-host', 'dsh-native-host.cmd')
+    // Chrome: cmd.exe /d /s /c ""<launcher>" <origin> --parent-window=<hwnd>"
+    const viaChrome = (caller: string) => run(process.env.ComSpec || 'cmd.exe',
+      ['/d', '/s', '/c', '""' + launcher + '" ' + caller + ' --parent-window=0"'],
+      frame(JSON.stringify({ cmd: 'status' })), process.env, true)
+    const ok = await viaChrome(CALLER)
+    expect(ok.body?.ok).toBe(true)
+    expect(ok.body?.dsh).toBe(process.execPath + ' ' + opts.dshEntry)
+    // DSH_HOME came from the launcher's own directory.
+    expect(ok.body?.logDir.toLowerCase()).toBe(path.join(dshHome, 'logs', 'chrome-native-host').toLowerCase())
+    expect((await viaChrome('chrome-extension://' + OLD_DEV_ID + '/')).body).toEqual(REFUSED)
+  })
+
+  it("knows each browser's key and user-data directory", () => {
+    const local = path.join('C:', 'Users', 'u', 'AppData', 'Local')
+    const browsers = windowsBrowsers(local)
+    expect(browsers.filter(b => b.always).map(b => b.key)).toEqual([CHROME_KEY])
+    expect(browsers.map(b => b.dataDir)).toContain(path.join(local, 'Microsoft', 'Edge', 'User Data'))
+    expect(browsers.map(b => b.key)).toEqual(['Google\\Chrome', 'Chromium', 'Microsoft\\Edge', 'BraveSoftware\\Brave-Browser']
+      .map(vendor => 'HKCU\\Software\\' + vendor + '\\NativeMessagingHosts\\com.dsh.chrome'))
+  })
+})
+
+describe('windowsLauncherScript', () => {
+  it('forwards the caller, finds everything else from its own directory, and never echoes', () => {
+    const script = windowsLauncherScript('C:\\Program Files\\nodejs\\node.exe', { ProgramFiles: 'C:\\Program Files' })
+    const lines = script.split('\r\n')
+    expect(lines[0]).toBe('@echo off')
+    // CRLF throughout: no bare LF a strict cmd parse could trip on.
+    expect(script.replace(/\r\n/g, '')).not.toMatch(/[\r\n]/)
+    expect(script).toContain('set "NODE=%ProgramFiles%\\nodejs\\node.exe"')
+    expect(script).toContain('for %%I in ("%~dp0..") do set "DSH_HOME=%%~fI"')
+    expect(lines).toContain('"%NODE%" "%~dp0dsh-native-host.mjs" %*')
+    // Fallbacks when the recorded node is gone.
+    expect(script).toContain('if not exist "%NODE%" set "NODE=node"')
+    expect(script).not.toMatch(/^echo /m)
+    expect(script).not.toContain('chcp')
+  })
+
+  it('writes a non-ASCII profile through its environment variable instead of literally', () => {
+    const env = { LOCALAPPDATA: 'C:\\Users\\张三\\AppData\\Local', USERPROFILE: 'C:\\Users\\张三' }
+    const script = windowsLauncherScript('C:\\Users\\张三\\AppData\\Local\\Volta\\bin\\node.exe', env)
+    expect(script).toContain('set "NODE=%LOCALAPPDATA%\\Volta\\bin\\node.exe"')
+    expect(script).not.toContain('张三')
+    expect(script).not.toContain('chcp')
+  })
+
+  it('switches cmd to UTF-8 only when a non-ASCII path cannot be shortened', () => {
+    const lines = windowsLauncherScript('D:\\工具\\node\\node.exe', {}).split('\r\n')
+    const chcp = lines.indexOf('chcp 65001 >nul 2>nul')
+    expect(chcp).toBeGreaterThan(0)
+    expect(chcp).toBeLessThan(lines.findIndex(l => l.startsWith('set "NODE=')))
+  })
+
+  it('escapes % so a literal path is not expanded as a variable', () => {
+    expect(windowsLauncherScript('C:\\100%\\node.exe', {})).toContain('set "NODE=C:\\100%%\\node.exe"')
+  })
+})
+
+describe('parseRegDefault', () => {
+  it('reads the default value in any UI language', () => {
+    const key = 'HKEY_CURRENT_USER\\Software\\Google\\Chrome\\NativeMessagingHosts\\com.dsh.chrome'
+    expect(parseRegDefault('\r\n' + key + '\r\n    (Default)    REG_SZ    C:\\Users\\u\\.dsh\\native-host\\com.dsh.chrome.json\r\n\r\n'))
+      .toBe('C:\\Users\\u\\.dsh\\native-host\\com.dsh.chrome.json')
+    expect(parseRegDefault('\r\n' + key + '\r\n    (默认)    REG_SZ    C:\\My Files\\com.dsh.chrome.json\r\n'))
+      .toBe('C:\\My Files\\com.dsh.chrome.json')
+    expect(parseRegDefault('')).toBeUndefined()
   })
 })

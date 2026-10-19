@@ -177,7 +177,7 @@ describe('native host: protocol', () => {
     const r = await host([CALLER], { cmd: 'filePaths', board: 'general' })
     expect(r.body?.ok).toBe(true)
     for (const p of r.body.paths) expect(path.isAbsolute(p)).toBe(true)
-  })
+  }, 20_000) // Windows PowerShell cold start alone can take several seconds on CI.
 
   it('will not start dsh on a non-loopback host', async () => {
     const r = await host([CALLER], { cmd: 'start', target: 'web', host: '0.0.0.0', port: 3080 })

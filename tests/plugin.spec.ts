@@ -5,7 +5,10 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { bridgeConfig, DAEMON_PORT, localBuildHash, parseClientFrame, restartDecision } from '../src/server.ts'
+import { closeSync, existsSync, mkdtempSync, readFileSync, writeFileSync, writeSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import * as path from 'node:path'
+import { bridgeConfig, DAEMON_PORT, localBuildHash, openDaemonLog, parseClientFrame, restartDecision } from '../src/server.ts'
 
 describe('chrome-server plugin', () => {
   describe('bridgeConfig', () => {
@@ -107,6 +110,44 @@ describe('chrome-server plugin', () => {
       const expected = createHash('sha256').update(readFileSync(file)).digest('hex')
       expect(localBuildHash(file)).toBe(expected)
       expect(localBuildHash(file)).toMatch(/^[0-9a-f]{64}$/)
+    })
+  })
+
+  // The detached daemon must never get stdio pipes into dsh web: the pipes die
+  // with dsh web, and a dead log destination once took down every extension
+  // connection. Its output goes to a file instead.
+  describe('openDaemonLog', () => {
+    const fresh = () => mkdtempSync(path.join(tmpdir(), 'dsh-chrome-log-'))
+
+    it('opens $DSH_HOME/logs/chrome-daemon.log for appending, creating the directory', () => {
+      const dshHome = fresh()
+      const first = openDaemonLog({ dshHome })
+      expect(first.file).toBe(path.join(dshHome, 'logs', 'chrome-daemon.log'))
+      expect(typeof first.fd).toBe('number')
+      writeSync(first.fd as number, 'one\n')
+      closeSync(first.fd as number)
+      const second = openDaemonLog({ dshHome })
+      writeSync(second.fd as number, 'two\n')
+      closeSync(second.fd as number)
+      expect(readFileSync(first.file!, 'utf8')).toBe('one\ntwo\n')
+    })
+
+    it('rotates an oversized log to .1 and starts a fresh one', () => {
+      const dshHome = fresh()
+      const seed = openDaemonLog({ dshHome })
+      closeSync(seed.fd as number)
+      writeFileSync(seed.file!, 'x'.repeat(64))
+      const next = openDaemonLog({ dshHome, maxBytes: 32 })
+      closeSync(next.fd as number)
+      expect(readFileSync(`${seed.file}.1`, 'utf8')).toBe('x'.repeat(64))
+      expect(readFileSync(next.file!, 'utf8')).toBe('')
+    })
+
+    it('never throws: an unusable location degrades to no log', () => {
+      const dshHome = fresh()
+      writeFileSync(path.join(dshHome, 'logs'), 'a file where the directory should be')
+      expect(openDaemonLog({ dshHome })).toEqual({ fd: 'ignore' })
+      expect(existsSync(path.join(dshHome, 'logs', 'chrome-daemon.log'))).toBe(false)
     })
   })
 })

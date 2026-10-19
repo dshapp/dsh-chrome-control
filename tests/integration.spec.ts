@@ -230,6 +230,119 @@ describe_e2e('chrome-daemon (end-to-end)', () => {
   })
 })
 
+// The daemon is spawned detached and outlives the dsh web that started it. Its
+// stdio pipes then have no reader: every log write fails with EPIPE. That must
+// cost nothing but the log line. It once cost the whole connection — the write
+// error was reported with eprintln! to the equally dead stderr, which panics,
+// killing the socket task right after it attached: tool calls still went out,
+// but no hello, pong or tool_result was ever read again, so the extension
+// looked disconnected and every mcp__chrome__* call timed out. The suite above
+// spawns with stdio 'ignore' (/dev/null never fails), which hid exactly that.
+describe_e2e('chrome-daemon after its parent has gone (orphaned stdio)', () => {
+  const OPORT = 37189
+  const OBASE = `http://127.0.0.1:${OPORT}`
+  let orphan: ReturnType<typeof spawn> | undefined
+
+  beforeAll(async () => {
+    orphan = spawn(BIN!, ['--port', String(OPORT), '--host', '127.0.0.1'], { stdio: ['ignore', 'pipe', 'pipe'] })
+    // Wait for the "listening" line, then hang up both pipes, exactly what the
+    // parent's exit does to a detached daemon.
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('no startup line from chrome-daemon')), 10_000)
+      orphan!.stdout!.once('data', () => { clearTimeout(timer); resolve() })
+    })
+    orphan.stdout!.destroy()
+    orphan.stderr!.destroy()
+  }, 30_000)
+
+  afterAll(() => {
+    if (orphan !== undefined && !orphan.killed) orphan.kill('SIGTERM')
+  })
+
+  it('still acknowledges hello, reports connected, and completes a tool call', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${OPORT}/chrome/ws`, { origin: EXTENSION_ORIGIN })
+    const frames: any[] = []
+    const waiters: Array<(f: any) => boolean> = []
+    ws.on('message', d => {
+      const f = JSON.parse(d.toString())
+      frames.push(f)
+      for (let i = waiters.length - 1; i >= 0; i--) if (waiters[i]!(f)) waiters.splice(i, 1)
+    })
+    const next = (type: string) => new Promise<any>((resolve, reject) => {
+      const hit = frames.find(f => f.type === type)
+      if (hit) return resolve(hit)
+      const timer = setTimeout(() => reject(new Error(`no ${type} frame`)), 3_000)
+      waiters.push(f => (f.type === type ? (clearTimeout(timer), resolve(f), true) : false))
+    })
+    await new Promise<void>(resolve => ws.on('open', resolve))
+
+    ws.send(JSON.stringify({ type: 'hello', payload: { extensionVersion: 'orphan-1' } }))
+    await next('hello_ack')
+    const status = await (await fetch(`${OBASE}/chrome/status`)).json() as any
+    expect(status.extension_connected).toBe(true)
+    expect(status.extension_version).toBe('orphan-1')
+
+    const call = fetch(`${OBASE}/chrome/mcp`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_tabs', arguments: { session: 's' } } }),
+    }).then(r => r.json() as Promise<any>)
+    const frame = await next('tool_call')
+    ws.send(JSON.stringify({ type: 'tool_result', responseToRequestId: frame.requestId, payload: { data: { tabs: [] } } }))
+    const v = await call
+    expect(v.result.isError).toBe(false)
+    ws.close()
+  }, 15_000)
+
+  it('logs to the file openDaemonLog hands it, the way the plugin spawns it', async () => {
+    const { mkdtempSync, closeSync, readFileSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { openDaemonLog } = await import('../src/server.ts')
+    const LPORT = 37190
+    const output = openDaemonLog({ dshHome: mkdtempSync(path.join(tmpdir(), 'dsh-chrome-it-')) })
+    expect(typeof output.fd).toBe('number')
+    const daemon = spawn(BIN!, ['--port', String(LPORT), '--host', '127.0.0.1'], { detached: true, stdio: ['ignore', output.fd, output.fd] })
+    closeSync(output.fd as number)
+    try {
+      const deadline = Date.now() + 10_000
+      for (;;) {
+        try { if ((await fetch(`http://127.0.0.1:${LPORT}/chrome/status`)).ok) break } catch {}
+        if (Date.now() > deadline) throw new Error('daemon did not start')
+        await new Promise(r => setTimeout(r, 100))
+      }
+      const ws = new WebSocket(`ws://127.0.0.1:${LPORT}/chrome/ws`, { origin: EXTENSION_ORIGIN })
+      const ack = new Promise<void>(resolve => ws.on('message', d => { if (JSON.parse(d.toString()).type === 'hello_ack') resolve() }))
+      await new Promise<void>(resolve => ws.on('open', resolve))
+      ws.send(JSON.stringify({ type: 'hello', payload: { extensionVersion: 'log-1' } }))
+      await ack
+      ws.close()
+      await new Promise(r => setTimeout(r, 200))
+      const text = readFileSync(output.file!, 'utf8')
+      expect(text).toContain('chrome-daemon listening')
+      expect(text).toContain('hello from extension log-1')
+    } finally {
+      daemon.kill('SIGTERM')
+    }
+  }, 20_000)
+
+  it('serves a reconnecting extension too (every connection logs)', async () => {
+    for (const version of ['orphan-2', 'orphan-3']) {
+      const ws = new WebSocket(`ws://127.0.0.1:${OPORT}/chrome/ws`, { origin: EXTENSION_ORIGIN })
+      const ack = new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`no hello_ack for ${version}`)), 3_000)
+        ws.on('message', d => { if (JSON.parse(d.toString()).type === 'hello_ack') { clearTimeout(timer); resolve() } })
+      })
+      await new Promise<void>(resolve => ws.on('open', resolve))
+      ws.send(JSON.stringify({ type: 'hello', payload: { extensionVersion: version } }))
+      await ack
+      const status = await (await fetch(`${OBASE}/chrome/status`)).json() as any
+      expect(status.extension_version).toBe(version)
+      ws.close()
+      await new Promise(r => setTimeout(r, 100))
+    }
+  }, 15_000)
+})
+
 // POST /chrome/shutdown is how an upgraded dsh web retires a daemon it does
 // not own. These run against their own throwaway daemon on a separate port,
 // because a successful shutdown ends the process under test.

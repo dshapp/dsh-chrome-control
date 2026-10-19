@@ -28,7 +28,7 @@ use tokio::sync::Notify;
 use tokio::time::{interval, Duration};
 
 use crate::build_id;
-use crate::hub::{Hub, TOOL_TIMEOUT_MS};
+use crate::hub::{Hub, Outbound, TOOL_TIMEOUT_MS};
 use crate::mcp;
 use crate::protocol::{parse_client_frame, ServerFrame};
 
@@ -155,6 +155,66 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Resp
         .on_upgrade(move |socket| serve_extension(socket, state))
 }
 
+/// Releases one extension connection however [`serve_extension`] ends.
+///
+/// The normal exit calls [`ConnectionTeardown::finish`], which detaches from
+/// the hub synchronously. Anything else — a panic unwinding out of the task —
+/// reaches `Drop`, which does the same work without awaiting. Without this, a
+/// task that died after attaching left the hub holding a socket nobody read:
+/// tool calls kept going out, no answer was ever read back, and since the
+/// pinger dies with the task, nothing would ever notice. That is exactly what
+/// a panicking log write once caused (see `crate::log_sink`).
+struct ConnectionTeardown {
+    hub: Hub,
+    outbound: Outbound,
+    /// The writer and pinger tasks. The writer owns the socket's sink half, so
+    /// the socket is only released once it is gone. Aborted, never awaited: it
+    /// ends when every sender is dropped, and `outbound` still holds one —
+    /// awaiting it parks forever and leaves the connection in CLOSE_WAIT (that
+    /// leaked one file descriptor per reconnect until no WebSocket could be
+    /// served at all, while HTTP went on answering normally).
+    tasks: Vec<tokio::task::AbortHandle>,
+    done: bool,
+}
+
+impl ConnectionTeardown {
+    fn new(hub: Hub, outbound: Outbound) -> Self {
+        Self { hub, outbound, tasks: Vec::new(), done: false }
+    }
+
+    fn track(&mut self, task: tokio::task::AbortHandle) {
+        self.tasks.push(task);
+    }
+
+    /// Orderly teardown: failing waiters and clearing the hub happen before
+    /// this returns, so `/chrome/status` is accurate the moment the socket ends.
+    async fn finish(mut self) {
+        self.done = true;
+        for task in &self.tasks {
+            task.abort();
+        }
+        self.hub.detach(&self.outbound).await;
+    }
+}
+
+impl Drop for ConnectionTeardown {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        for task in &self.tasks {
+            task.abort();
+        }
+        // Drop cannot await, so detach on the runtime. detach is a no-op when a
+        // newer socket has already taken over.
+        let hub = self.hub.clone();
+        let outbound = self.outbound.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move { hub.detach(&outbound).await });
+        }
+    }
+}
+
 /// Pump one extension socket until it closes.
 async fn serve_extension(socket: WebSocket, state: AppState) {
     // One channel + writer task: frames handed to `outbound` land on the socket.
@@ -177,6 +237,10 @@ async fn serve_extension(socket: WebSocket, state: AppState) {
         }
     });
 
+    // Armed before attaching, so no exit path — panics included — can leave the
+    // hub dispatching to this socket after it stops being served.
+    let mut teardown = ConnectionTeardown::new(state.hub.clone(), outbound.clone());
+    teardown.track(writer.abort_handle());
     state.hub.attach(outbound.clone()).await;
     tracing::info!("chrome extension connected");
 
@@ -223,6 +287,7 @@ async fn serve_extension(socket: WebSocket, state: AppState) {
             let _ = dead_tx.send(());
         }
     });
+    teardown.track(pinger.abort_handle());
 
     // Drive incoming messages until the peer closes or the pinger declares it
     // dead. Racing the two is what makes a half-open socket recoverable: the
@@ -262,17 +327,8 @@ async fn serve_extension(socket: WebSocket, state: AppState) {
         }
     }
 
-    pinger.abort();
-    hub.detach(&outbound).await;
+    teardown.finish().await;
     tracing::info!("chrome extension disconnected");
-    // The writer task owns the sink half of this socket, so the socket is only
-    // released once that task is gone. It must be aborted, never awaited: it
-    // ends when every sender is dropped, and `tx` and `outbound` are still in
-    // scope right here — awaiting it parks this function forever, leaving the
-    // connection in CLOSE_WAIT. That hang leaked one file descriptor per
-    // reconnect until the daemon could no longer serve a WebSocket at all,
-    // while its HTTP routes went on answering normally.
-    writer.abort();
 }
 
 #[cfg(test)]
@@ -281,6 +337,48 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    fn test_outbound() -> Outbound {
+        Arc::new(|_: &ServerFrame| true)
+    }
+
+    /// A connection task that dies by panicking must still let go of the hub;
+    /// otherwise tool calls keep flowing to a socket nobody reads.
+    #[tokio::test]
+    async fn a_panicking_connection_task_still_detaches() {
+        let hub = Hub::new(TOOL_TIMEOUT_MS);
+        let outbound = test_outbound();
+        let task = tokio::spawn({
+            let hub = hub.clone();
+            let outbound = outbound.clone();
+            async move {
+                let _teardown = ConnectionTeardown::new(hub.clone(), outbound.clone());
+                hub.attach(outbound).await;
+                panic!("simulated failure after attach");
+            }
+        });
+        assert!(task.await.unwrap_err().is_panic());
+        // Drop detaches on a spawned task; give it a turn.
+        for _ in 0..50 {
+            if !hub.is_live(&outbound).await {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!hub.is_live(&outbound).await, "hub still dispatches to the dead socket");
+    }
+
+    #[tokio::test]
+    async fn finish_detaches_before_returning() {
+        let hub = Hub::new(TOOL_TIMEOUT_MS);
+        let outbound = test_outbound();
+        let teardown = ConnectionTeardown::new(hub.clone(), outbound.clone());
+        hub.attach(outbound.clone()).await;
+        hub.record_hello("1".into()).await;
+        teardown.finish().await;
+        assert!(!hub.is_live(&outbound).await);
+        assert_eq!(hub.extension_state().await, (false, String::new()));
+    }
 
     #[tokio::test]
     async fn status_is_json() {

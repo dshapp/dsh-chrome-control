@@ -20,10 +20,10 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmodSync, existsSync, readFileSync } from 'node:fs'
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync } from 'node:fs'
 import * as http from 'node:http'
+import { homedir } from 'node:os'
 import * as path from 'node:path'
-import type { Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
 import * as McpClient from '@deepseek-ai/dsh-mcp-client'
@@ -196,10 +196,45 @@ async function waitForPortFree(): Promise<boolean> {
   }
 }
 
+/** Rotate the daemon log once it passes this size, at the next spawn. */
+const DAEMON_LOG_MAX_BYTES = 5 * 1024 * 1024
+
 /**
- * Spawn the detached daemon, wiring its stdio into the harness logger for as
- * long as this process lives. The child handle is intentionally not returned:
- * nothing here owns the daemon's lifetime.
+ * Open the file the detached daemon writes its stdout/stderr to:
+ * `$DSH_HOME/logs/chrome-daemon.log`, appended, with one `.1` generation kept
+ * once it outgrows `maxBytes`.
+ *
+ * Why a file and not pipes into this process's logger: the daemon outlives
+ * `dsh web`, and a pipe dies with its reader. From then on every daemon log
+ * write failed, and a failed log write once panicked the task serving the
+ * extension socket — the extension looked disconnected and every
+ * `mcp__chrome__*` call timed out until someone killed the daemon by hand. A
+ * file has no reader to lose. (The daemon now also survives a dead log
+ * destination on its own; this keeps its logs readable as well.)
+ *
+ * Never throws: on any failure the daemon simply gets no log (`'ignore'`).
+ *
+ * @returns the descriptor to hand to `spawn` (the caller closes its copy),
+ *   or `'ignore'`, plus the path for the harness log.
+ */
+export function openDaemonLog(options: { dshHome?: string, maxBytes?: number } = {}): { fd: number | 'ignore', file?: string } {
+  const dshHome = options.dshHome ?? (process.env.DSH_HOME || path.join(homedir(), '.dsh'))
+  const file = path.join(dshHome, 'logs', 'chrome-daemon.log')
+  try {
+    mkdirSync(path.dirname(file), { recursive: true })
+    try {
+      if (statSync(file).size > (options.maxBytes ?? DAEMON_LOG_MAX_BYTES)) renameSync(file, `${file}.1`)
+    } catch { /* no log yet */ }
+    return { fd: openSync(file, 'a'), file }
+  } catch {
+    return { fd: 'ignore' }
+  }
+}
+
+/**
+ * Spawn the detached daemon with its output going to `openDaemonLog()`'s file.
+ * The child handle is intentionally not returned: nothing here owns the
+ * daemon's lifetime.
  */
 function startDaemon(log: Context['logger']): void {
   const bin = resolveBinary()
@@ -211,29 +246,26 @@ function startDaemon(log: Context['logger']): void {
   if (process.platform !== 'win32') {
     try { chmodSync(bin, 0o755) } catch { /* may already be executable / readonly */ }
   }
-  const child = spawn(bin, ['--port', String(DAEMON_PORT), '--host', '127.0.0.1'], {
-    // Own process group: a group-wide signal to `dsh web` (Ctrl-C, SIGHUP) must
-    // not reach the daemon, and it outlives the parent as an orphan (PPID 1).
-    detached: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
-  child.stdout.on('data', d => log?.info(`[chrome-daemon] ${d.toString().trimEnd()}`))
-  child.stderr.on('data', d => log?.warn(`[chrome-daemon] ${d.toString().trimEnd()}`))
-  child.on('exit', code => { log?.info(`chrome-daemon exited code=${code}`) })
-  log?.info(`chrome-daemon spawned: ${bin} (pid ${child.pid})`)
-  // `child.unref()` alone is not enough: the two stdio pipes hold their own
-  // event-loop references, which would still pin this process at exit. Unref
-  // all three. The 'data' listeners above keep working while dsh web lives;
-  // once it exits the daemon's writes get EPIPE, which it ignores by design.
-  //
-  // The streams are typed `Readable`, but with `stdio: 'pipe'` Node backs them
-  // with a libuv handle exposing `unref`. Probe for it instead of asserting, so
-  // a stream without one is simply skipped rather than throwing.
-  child.unref()
-  for (const stream of [child.stdout, child.stderr]) {
-    const maybe = stream as Readable & { unref?: () => void }
-    maybe.unref?.()
+  const output = openDaemonLog()
+  let child: ReturnType<typeof spawn>
+  try {
+    child = spawn(bin, ['--port', String(DAEMON_PORT), '--host', '127.0.0.1'], {
+      // Own process group: a group-wide signal to `dsh web` (Ctrl-C, SIGHUP) must
+      // not reach the daemon, and it outlives the parent as an orphan (PPID 1).
+      detached: true,
+      // Never 'pipe': see openDaemonLog for what a pipe to a dead parent did.
+      stdio: ['ignore', output.fd, output.fd],
+    })
+  } finally {
+    // The child holds its own copy of the descriptor.
+    if (typeof output.fd === 'number') {
+      try { closeSync(output.fd) } catch { /* already closed */ }
+    }
   }
+  child.on('exit', code => { log?.info(`chrome-daemon exited code=${code}`) })
+  log?.info(`chrome-daemon spawned: ${bin} (pid ${child.pid}); log: ${output.file ?? 'none'}`)
+  // No stdio pipes means nothing else holds this process's event loop open.
+  child.unref()
 }
 
 /** Proxy `/chrome/status` on the shared web server to the daemon. */

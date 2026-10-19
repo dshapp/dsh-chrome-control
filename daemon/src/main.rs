@@ -13,6 +13,7 @@ mod host_guard;
 mod host_routes;
 mod host_server_ops;
 mod hub;
+mod log_sink;
 mod mcp;
 mod protocol;
 mod request_guard;
@@ -26,8 +27,12 @@ const DEFAULT_HOST: &str = "127.0.0.1";
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
+    // Logging must never be able to fail the daemon: see log_sink for how a dead
+    // stdout once took every extension connection down with it.
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("chrome_daemon=info".parse().unwrap()))
+        .with_writer(log_sink::stdout)
+        .log_internal_errors(false)
         .init();
 
     let port = parse_port().unwrap_or(DEFAULT_PORT);
@@ -37,7 +42,8 @@ async fn main() {
     // The parent's stdio pipe read ends close when dsh web exits. Without this,
     // the next log write raises SIGPIPE, whose default action is termination —
     // which would defeat running detached. Ignoring it degrades those writes to
-    // ordinary EPIPE errors that tracing discards.
+    // ordinary EPIPE errors, which log_sink then swallows. (tracing does *not*
+    // discard them on its own: it reports them via eprintln!, which panics.)
     #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);

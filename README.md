@@ -27,12 +27,13 @@ agent ──▶ dsh web :3080 ── in-box mcp-client (Node) ──HTTP──�
             └─ POST /host/*           settings-UI host operations    ← extension only
 ```
 
-The bundle's patch contributes two rows:
+The bundle's patch contributes three rows:
 
 | Row | Job |
 |---|---|
 | `chrome-server` | Starts `chrome-daemon` on `127.0.0.1:37086` (or reuses a running one with the same build hash, retiring a stale one), proxies `/chrome/status` on the harness's own `webServer`, and loads the in-box `@deepseek-ai/dsh-mcp-client` bridge against the daemon's `/chrome/mcp`. The bridge publishes the catalog as `mcp__chrome__*`. |
 | `chrome-skills` | Registers the bundled skill that teaches the agent how to drive those tools. |
+| `chrome-web-search` | Registers the `chrome-browser` search provider for the built-in `web_search` tool. Off until selected; see [Web search through Chrome](#web-search-through-chrome). |
 
 ## Install
 
@@ -146,6 +147,31 @@ loopback host.
 These are distinct from the harness's built-in `browser_*` tools, which drive a
 separate WebKit panel sharing no cookies or logins with Chrome. The bundled
 skill tells the agent when to use which.
+
+## Web search through Chrome
+
+The `chrome-web-search` row lets the harness's own `web_search` tool search in Chrome instead of calling a search API. The model sees the same `web_search` tool and result format; only the backend changes. Each query opens a fresh tab in its own `web_search` tab group, reads the organic results (title, destination URL, snippet, leading date as `publishedAt`), and closes the tab. Queries in one call run in parallel tabs.
+
+It is **off by default**: the DSH web service picks one search provider through `web.searchProvider`, and the shipped composition picks DeepSeek. Turn it on by selecting this provider, from the DSH App (Settings → Browser → Web search) or in the profile's `cordis.patch.yml`:
+
+```yaml
+- id: web
+  config:
+    searchProvider: chrome-browser
+
+- id: chrome-web-search
+  config:
+    engine: google        # google (default) | bing | baidu | sogou | toutiao
+```
+
+Both values are live settings: a change applies to the next search without a restart. Removing `searchProvider` returns to the composed default.
+
+| `chrome-web-search` key | Default | Meaning |
+|---|---|---|
+| `engine` | `google` | Result page to search: Google, Bing, Baidu, Sogou, or Toutiao (头条搜索). |
+| `resultWaitMs` | `10000` | How long to wait for the result page to render before reading it. |
+
+Failures reach the model as a failed `web_search` call: `WEB_PROVIDER_ERROR` when the daemon is unreachable, the extension is not attached, or the page cannot be read; `WEB_SEARCH_CAPTCHA` when the engine shows a bot check, in which case the tab stays open so the user can solve it; `WEB_ABORTED` when the call is cancelled or times out. Result reading depends on each engine's page markup (`ENGINE_SPECS` in [src/web-search.ts](src/web-search.ts)); a markup change can return empty results until the selectors are updated. Uninstalling this plugin while `web.searchProvider` still names `chrome-browser` makes every search fail with `WEB_PROVIDER_CONFIGURED_MISSING`; remove the setting too.
 
 ## Security
 

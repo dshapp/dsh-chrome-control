@@ -8,6 +8,9 @@
  * It serves exactly the things the store extension cannot do itself:
  *
  *   - `start`     — launch `dsh web` when it is not running;
+ *   - `restart`   — stop the `dsh web` listening on the extension's port and
+ *                   launch a fresh one (the settings page's "Restart server",
+ *                   mirroring the Mac app's ServerTermination + relaunch);
  *   - `cookie`    — sign the browser-session login cookie with the secret in
  *                   `$DSH_HOME/.credentials.yaml` (the secret never leaves here);
  *   - `filePaths` — the absolute paths of the files/folders on the macOS
@@ -279,12 +282,25 @@ function spawnSpec(command, args) {
   return { command, args, options };
 }
 
-async function startWeb(opts) {
+/** 扩展传来的 host/port 核过才用:只在环回上、只用合法端口。不合法时回失败回包。 */
+function webTarget(opts) {
   const host = opts.host || "127.0.0.1";
   const port = Number(opts.port) || 3080;
-  if (!LOOPBACK_HOSTS.has(String(host).toLowerCase())) return { ok: false, reason: "host-not-loopback", host, port };
-  if (!Number.isInteger(port) || port < 1 || port > 65535) return { ok: false, reason: "bad-port", host, port };
+  if (!LOOPBACK_HOSTS.has(String(host).toLowerCase())) return { error: { ok: false, reason: "host-not-loopback", host, port } };
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return { error: { ok: false, reason: "bad-port", host, port } };
+  return { host, port };
+}
+
+async function startWeb(opts) {
+  const target = webTarget(opts);
+  if (target.error) return target.error;
+  const { host, port } = target;
   if (await probePort(port, host, 800)) return { ok: true, alreadyUp: true, host, port };
+  return await launchWeb(host, port);
+}
+
+/** 起一个新的 dsh web 并等端口就绪。不先探活 —— 调用方已经确认端口空着。 */
+async function launchWeb(host, port) {
   const launch = resolveLaunch();
   const logPath = path.join(logDir(), "dsh-web.log");
   let logFd = null;
@@ -308,13 +324,132 @@ async function startWeb(opts) {
     : { ok: false, pid, host, port, log: logPath, reason: "port-stayed-down" };
 }
 
+/** SIGTERM 之后给 dsh web 收尾(关会话、带走工具子进程)的时间,超时再 SIGKILL。与 Mac 一致。 */
+const STOP_GRACE_MS = 5000;
+const FORCED_EXIT_WAIT_MS = 2000;
+
+/** 跑一个只读的系统命令,拿 stdout;失败(含命令不存在)回 null。 */
+function capture(command, args, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    execFile(command, args, { timeout: timeoutMs, windowsHide: true }, (error, stdout) => {
+      // lsof 查不到监听者时退出码是 1 且 stdout 为空 —— 那是"没有",不是"失败"。
+      if (error && !String(stdout || "").trim()) return resolve(error.code === 1 ? "" : null);
+      resolve(String(stdout || ""));
+    });
+  });
+}
+
+/** 系统工具常在 /usr/sbin(macOS 的 lsof),Chrome 给宿主的 PATH 未必带它。 */
+function findSystemTool(name) {
+  return findExecutable(name) ?? ["/usr/sbin", "/sbin"].map((dir) => path.join(dir, name)).find((file) => {
+    try { fs.accessSync(file, fs.constants.X_OK); return true; } catch { return false; }
+  }) ?? null;
+}
+
+/**
+ * 监听这个 TCP 端口的 pid,没有就 null。
+ *
+ * 按端口查而不是记 pid:要重启的那个 dsh web 多半不是本宿主起的(用户在终端里
+ * 起的、Mac App 起的、或上一次重启起的 —— 宿主每次请求都是新进程,什么也记不住)。
+ * 不按绑定地址过滤,理由同 Mac 的 ServerTermination:绑在 *:port 的也得找得到。
+ * Linux 上没有 lsof 时退回 ss。
+ */
+async function listeningPid(port) {
+  const lsof = findSystemTool("lsof");
+  if (lsof) {
+    const out = await capture(lsof, ["-nP", "-t", "-sTCP:LISTEN", `-iTCP:${port}`]);
+    if (out !== null) {
+      const pid = out.split(/\s+/).map(Number).find((value) => Number.isInteger(value) && value > 0);
+      return pid ?? null;
+    }
+  }
+  const ss = findSystemTool("ss");
+  if (ss) {
+    const out = await capture(ss, ["-Hltnp", `sport = :${port}`]);
+    const match = out && /pid=(\d+)/.exec(out);
+    if (match) return Number(match[1]);
+  }
+  return null;
+}
+
+/** 进程的完整命令行;拿不到回 null。 */
+async function commandLineOf(pid) {
+  const out = await capture(findSystemTool("ps") ?? "/bin/ps", ["-o", "command=", "-p", String(pid)]);
+  const line = out?.trim();
+  return line || null;
+}
+
+/**
+ * 端口上的是不是 dsh web。重启会 kill 这个进程,所以只认命令行里同时有 dsh
+ * 与 web 子命令的那一个 —— 端口来自扩展设置,被别的程序占着时宁可报错也不能误杀。
+ * resolveLaunch 的入口(DSH_BIN / 记下的 dsh 入口)也算 dsh:改过名的安装照样认得。
+ */
+function looksLikeDshWeb(commandLine, launch = resolveLaunch()) {
+  const line = String(commandLine || "");
+  if (!/(^|\s)web(\s|$)/.test(line)) return false;
+  if (/(^|[\s/\\])dsh(\.(c?js|mjs|cmd|exe))?(\s|$)/i.test(line) || /@deepseek-ai[\\/]dsh[\\/]/.test(line)) return true;
+  return [launch.command, ...launch.args].some((part) => part && part !== "dsh" && path.isAbsolute(part) && line.includes(part));
+}
+
+function isAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (error) { return error?.code === "EPERM"; }
+}
+
+async function waitForExit(pid, port, host, budgetMs) {
+  const deadline = Date.now() + budgetMs;
+  while (Date.now() < deadline) {
+    if (!isAlive(pid) && !(await probePort(port, host, 300))) return true;
+    await sleep(100);
+  }
+  return !isAlive(pid) && !(await probePort(port, host, 300));
+}
+
+/**
+ * 重启 dsh web:停掉端口上的那个,再在同一地址起一个新的。
+ *
+ * 先礼后兵:SIGTERM 让 dsh 正常收尾(它把 SIGTERM 当普通停止,会带走自己起的
+ * 工具子进程),5s 不走再 SIGKILL,并确认它真的没了才去绑端口。
+ * 端口本来就空着(服务已经挂了)时直接起一个 —— 用户按"重启"要的是一个新服务。
+ *
+ * Windows 暂不支持:找监听进程与核对命令行都要另一套工具,先如实回不支持,
+ * 扩展会退回 chrome-daemon 的重启。
+ */
+async function restartWeb(opts) {
+  const target = webTarget(opts);
+  if (target.error) return target.error;
+  const { host, port } = target;
+  if (process.platform === "win32") return { ok: false, reason: "unsupported-platform", host, port };
+  const previousPid = await listeningPid(port);
+  let stopped = false;
+  if (previousPid) {
+    const commandLine = await commandLineOf(previousPid);
+    if (!looksLikeDshWeb(commandLine)) {
+      return { ok: false, reason: "not-dsh-web", host, port, pid: previousPid };
+    }
+    process.kill(previousPid, "SIGTERM");
+    stopped = await waitForExit(previousPid, port, host, STOP_GRACE_MS);
+    if (!stopped) {
+      try { process.kill(previousPid, "SIGKILL"); } catch {}
+      stopped = await waitForExit(previousPid, port, host, FORCED_EXIT_WAIT_MS);
+    }
+    if (!stopped) return { ok: false, reason: "still-running", host, port, pid: previousPid };
+  } else if (await probePort(port, host, 800)) {
+    // 端口通着却查不到是谁(没有 lsof/ss,或权限不够):不知道要停谁,就不动它。
+    return { ok: false, reason: "listener-unknown", host, port };
+  }
+  const started = await launchWeb(host, port);
+  return { ...started, stopped, previousPid: previousPid ?? null };
+}
+
 async function status() {
   const launch = resolveLaunch();
   const found = launch.args.length > 0 || fs.existsSync(launch.command);
   return {
     ok: true,
     host: HOST_NAME,
-    version: "2.1.0",
+    version: "2.2.0",
+    // 扩展据此决定"重启"走本宿主还是退回 chrome-daemon;老宿主没有这个字段。
+    commands: ["start", "restart", "status", "cookie", "filePaths"],
     dsh: found ? [launch.command, ...launch.args].join(" ") : null,
     logDir: logDir(),
   };
@@ -455,6 +590,9 @@ async function dispatch(msg) {
   switch (msg.cmd) {
     case "start":
       if (msg.target === "web") return await startWeb(msg);
+      return { ok: false, reason: "unknown-target" };
+    case "restart":
+      if (msg.target === "web") return await restartWeb(msg);
       return { ok: false, reason: "unknown-target" };
     case "status": return await status();
     case "cookie": return signBrowserSession(msg.host, Number(msg.port));

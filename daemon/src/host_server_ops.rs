@@ -19,6 +19,18 @@
 //! one copy and keep running the other: the version never changes and the
 //! update looks like it worked.
 //!
+//! # npm global installs: follow the copy that is running
+//!
+//! The two-copies hazard above is about updating one copy and launching
+//! another, not about pnpm as such. So when the `dsh web` on the managed port
+//! runs from an npm global install (`<prefix>/lib/node_modules/@deepseek-ai/dsh`,
+//! linked as `<prefix>/bin/dsh`), update and restart both target *that* copy:
+//! `npm install --global --prefix <prefix>` and `<prefix>/bin/dsh web`. The
+//! install is classified from the running process, never from `PATH`, so the
+//! copy updated and the copy relaunched are the same one by construction. A
+//! root-owned prefix (the official Node .pkg's `/usr/local`) is escalated
+//! through the macOS authorization dialog, exactly as the Mac app does.
+//!
 //! For the same family of reasons the shim path is used *verbatim* and never
 //! canonicalized. The shim `exec`s a content-addressed directory
 //! (`global/v11/<hash>/node_modules/...`) whose `<hash>` changes on every
@@ -27,8 +39,10 @@
 
 include!("host_server_ops_update_tests.rs");
 
+include!("host_server_ops_npm_tests.rs");
+
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::host_exec::{self, ExecError, ExecOutput};
@@ -50,6 +64,14 @@ const STOP_BUDGET: Duration = Duration::from_secs(10);
 const START_BUDGET: Duration = Duration::from_secs(20);
 /// Budget for `pnpm view`, which reaches the registry.
 const VIEW_TIMEOUT: Duration = Duration::from_secs(20);
+/// Budget for an install behind the authorization dialog.
+///
+/// Deliberately not a real limit: expiry kills the child, and a root npm
+/// killed after the password is accepted leaves the global install broken
+/// (half-extracted package, no bin link) with nothing this user can repair.
+/// The clock also starts before the dialog, so it cannot tell a user still
+/// typing from an install still running. A dismissed dialog ends it instead.
+pub const ADMIN_INSTALL_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Why a server operation could not be attempted.
 #[derive(Debug, PartialEq, Eq)]
@@ -62,6 +84,17 @@ pub enum ServerOpError {
     DshNotInstalledViaPnpm,
     /// `pnpm` itself is not on `PATH`.
     PnpmMissing,
+    /// The running dsh is an npm global install, but no `npm` can be found.
+    NpmMissing,
+    /// The running dsh comes from neither a pnpm nor an npm global install
+    /// (an npx cache, a project's node_modules, a checkout), so there is no
+    /// install this daemon could update without touching some other copy.
+    UnsupportedInstall(String),
+    /// The npm global root needs root, and this platform has no dialog to ask.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    NpmRootNotWritable { root: String, command: String },
+    /// The user dismissed the authorization dialog.
+    AuthorizationCancelled,
     /// The requested port is not one we manage.
     PortNotAllowed(u16),
     /// Nothing is listening, so there is nothing to restart.
@@ -81,6 +114,14 @@ impl ServerOpError {
                 "dsh is not installed under the pnpm global root; install it with: pnpm add -g {DSH_PACKAGE} --registry {DSH_REGISTRY}"
             ),
             ServerOpError::PnpmMissing => "pnpm was not found on PATH".to_string(),
+            ServerOpError::NpmMissing => "dsh is an npm global install, but npm was not found".to_string(),
+            ServerOpError::UnsupportedInstall(dir) => format!(
+                "the running dsh ({dir}) is not a global npm or pnpm install; install it with: npm install -g {DSH_PACKAGE}"
+            ),
+            ServerOpError::NpmRootNotWritable { root, command } => {
+                format!("the npm global directory {root} is not writable by this user; run: {command}")
+            }
+            ServerOpError::AuthorizationCancelled => "the administrator authorization was cancelled".to_string(),
             ServerOpError::PortNotAllowed(p) => format!("port {p} is not managed by this daemon"),
             ServerOpError::NotRunning(p) => format!("nothing is listening on port {p}"),
             ServerOpError::NotDshWeb { pid, command } => {
@@ -160,6 +201,206 @@ pub fn resolve_pnpm() -> Result<PathBuf, ServerOpError> {
         }
     }
     Err(ServerOpError::PnpmMissing)
+}
+
+/// How the dsh behind the managed port is installed: which tool updates it,
+/// and which executable starts it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DshInstall {
+    /// A pnpm global install, launched through the `$PNPM_HOME/dsh` shim.
+    Pnpm { dsh: PathBuf },
+    /// An npm global install under `prefix`.
+    Npm {
+        prefix: PathBuf,
+        /// The npm that installs into `prefix` (`<prefix>/bin/npm` when present).
+        npm: PathBuf,
+        /// Directory of the `node` the running server uses, put first on `PATH`
+        /// so the env-node launchers of npm and dsh pick the same Node.
+        node_dir: Option<PathBuf>,
+    },
+}
+
+impl DshInstall {
+    /// The executable that starts `dsh web`: the pnpm shim, or the npm bin link.
+    /// Never canonicalized, for the same reason as the pnpm shim: it must keep
+    /// naming the right copy after an update rewrites what it points at.
+    pub fn launcher(&self) -> PathBuf {
+        match self {
+            DshInstall::Pnpm { dsh } => dsh.clone(),
+            DshInstall::Npm { prefix, .. } => prefix.join("bin/dsh"),
+        }
+    }
+
+    /// Extra environment for anything run against this install.
+    ///
+    /// npm and the dsh bin link are `#!/usr/bin/env node` scripts, and a daemon
+    /// started from a GUI has a minimal `PATH`, so the running server's Node and
+    /// the prefix's bin go first. pnpm keeps the inherited environment, as before.
+    pub fn env(&self) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+        if let DshInstall::Npm { prefix, node_dir, .. } = self {
+            env.insert("PATH".to_string(), npm_search_path(prefix, node_dir.as_deref(), std::env::var_os("PATH")));
+        }
+        env
+    }
+}
+
+/// `PATH` for an npm install: the server's Node, the prefix's bin, then the rest.
+pub fn npm_search_path(prefix: &Path, node_dir: Option<&Path>, inherited: Option<std::ffi::OsString>) -> String {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    dirs.extend(node_dir.map(Path::to_path_buf));
+    dirs.push(prefix.join("bin"));
+    match inherited {
+        Some(path) => dirs.extend(std::env::split_paths(&path)),
+        None => dirs.extend(["/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(PathBuf::from)),
+    }
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|dir| seen.insert(dir.clone()));
+    std::env::join_paths(dirs).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// Whether a package directory lives in pnpm's store rather than an npm prefix.
+fn is_pnpm_store_path(dir: &Path) -> bool {
+    let names: Vec<&std::ffi::OsStr> = dir.iter().collect();
+    names.iter().any(|name| *name == ".pnpm")
+        || names.windows(2).any(|pair| pair[0] == "pnpm" && pair[1] == "global")
+}
+
+/// The npm prefix that owns `package_dir`, if it is an npm *global* install.
+///
+/// npm's global layout on Unix is `<prefix>/lib/node_modules/<package>`. Anything
+/// else — pnpm's store, an npx cache (`_npx/<hash>/node_modules`), a project's
+/// own node_modules — is not a global install and yields `None`. The caller
+/// still proves the prefix links this package as `bin/dsh` before trusting it.
+pub fn npm_prefix_of(package_dir: &Path) -> Option<PathBuf> {
+    if !package_dir.ends_with(Path::new("node_modules").join(DSH_PACKAGE)) || is_pnpm_store_path(package_dir) {
+        return None;
+    }
+    let node_modules = package_dir.parent()?.parent()?;
+    let lib = node_modules.parent()?;
+    if lib.file_name()? != "lib" {
+        return None;
+    }
+    lib.parent().map(Path::to_path_buf)
+}
+
+/// The Node directory of a running command line, when it names node by path.
+fn node_dir_of(command: &str) -> Option<PathBuf> {
+    let first = PathBuf::from(command.split_whitespace().next()?);
+    let is_node = first.file_name().and_then(|n| n.to_str()).is_some_and(|n| n == "node" || n.starts_with("node."));
+    (first.is_absolute() && is_node && first.is_file()).then(|| first.parent().map(Path::to_path_buf)).flatten()
+}
+
+/// The first `name` on `PATH`.
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?).map(|dir| dir.join(name)).find(|p| p.is_file())
+}
+
+/// Classify the install behind the `dsh web` on `port`.
+///
+/// A server running from an npm global prefix is that prefix's npm install.
+/// Everything else keeps the original pnpm resolution — including no server at
+/// all, so a machine without a running server behaves exactly as before.
+pub fn resolve_install<P: SystemProbe>(probe: &P, port: u16) -> Result<DshInstall, ServerOpError> {
+    if let Some(command) = probe.pid_on_port(port).and_then(|pid| probe.command_of(pid)).filter(|c| is_dsh_web_command(c)) {
+        if let Some(dir) = dsh_package_dir(&command).and_then(|d| std::fs::canonicalize(d).ok()) {
+            if let Some(prefix) = npm_prefix_of(&dir) {
+                // The bin link must point at the package that is running; otherwise
+                // updating this prefix would not update the running copy.
+                let linked = std::fs::canonicalize(prefix.join("bin/dsh")).ok();
+                if linked.as_deref() != Some(dir.join("lib/bin.js").as_path()) {
+                    return Err(ServerOpError::UnsupportedInstall(dir.to_string_lossy().into_owned()));
+                }
+                let npm = Some(prefix.join("bin/npm")).filter(|p| p.is_file())
+                    .or_else(|| find_on_path("npm"))
+                    .ok_or(ServerOpError::NpmMissing)?;
+                return Ok(DshInstall::Npm { prefix, npm, node_dir: node_dir_of(&command) });
+            }
+            if !is_pnpm_store_path(&dir) {
+                return Err(ServerOpError::UnsupportedInstall(dir.to_string_lossy().into_owned()));
+            }
+        }
+    }
+    Ok(DshInstall::Pnpm { dsh: resolve_dsh()? })
+}
+
+/// npm's arguments for installing `target` into exactly `prefix`.
+///
+/// `--prefix` pins the install to the running copy even when the npm found is
+/// another Node's, whose own global prefix would be somewhere else.
+pub fn npm_update_args(prefix: &Path, target: &str) -> Result<Vec<String>, String> {
+    validate_update_target(target)?;
+    Ok(vec![
+        "install".into(), "--global".into(), "--no-fund".into(), "--no-audit".into(),
+        "--prefix".into(), prefix.to_string_lossy().into_owned(),
+        "--registry".into(), DSH_REGISTRY.into(), format!("{DSH_PACKAGE}@{target}"),
+    ])
+}
+
+/// Whether npm needs root to write `prefix`: the package's scope directory,
+/// node_modules and bin must all be writable by this user.
+#[cfg(unix)]
+pub fn npm_root_requires_admin(prefix: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let node_modules = prefix.join("lib/node_modules");
+    let scope = node_modules.join(DSH_PACKAGE).parent().map(Path::to_path_buf).unwrap_or_else(|| node_modules.clone());
+    [scope, node_modules, prefix.join("bin")].iter().filter(|dir| dir.exists()).any(|dir| {
+        let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else { return true };
+        unsafe { libc::access(path.as_ptr(), libc::W_OK) != 0 }
+    })
+}
+#[cfg(not(unix))]
+pub fn npm_root_requires_admin(_prefix: &Path) -> bool { false }
+
+/// Single-quote one argument for `/bin/sh`.
+pub fn shell_quoted(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', "'\\''"))
+}
+
+/// The one shell command line this module ever builds: the privileged npm
+/// install. `do shell script` takes only a string, so the no-shell rule of
+/// [`crate::host_exec`] cannot hold here; instead every word is a fixed string,
+/// a path read from the filesystem, or a target that passed
+/// [`validate_update_target`], and each is single-quoted. `PATH` is fixed
+/// rather than inherited, so root resolves `node` the same way the user did.
+pub fn privileged_command(npm: &Path, args: &[String], path_env: &str) -> String {
+    ["/usr/bin/env".to_string(), format!("PATH={path_env}"), npm.to_string_lossy().into_owned()]
+        .iter().chain(args).map(|word| shell_quoted(word)).collect::<Vec<_>>().join(" ")
+}
+
+/// The install arguments for a run as root, with a cache of its own.
+///
+/// npm as root writes root-owned entries into the user's `~/.npm`, after which
+/// every ordinary npm command of that user fails with EACCES ("sudo chown -R
+/// … ~/.npm"). A separate cache keeps the escalation from breaking the user's npm.
+pub fn privileged_args(args: &[String]) -> Vec<String> {
+    let cache = std::env::temp_dir().join("dsh-chrome-npm-admin-cache");
+    let mut out = args.to_vec();
+    out.extend(["--cache".to_string(), cache.to_string_lossy().into_owned()]);
+    out
+}
+
+/// `osascript` source running `command` through the authorization dialog.
+pub fn admin_apple_script(command: &str) -> String {
+    let escaped = command.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("do shell script \"{escaped}\" with administrator privileges")
+}
+
+/// Read a package's version from its manifest, without running it.
+fn manifest_version(package_dir: &Path) -> Option<String> {
+    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(package_dir.join("package.json")).ok()?).ok()?;
+    if manifest["name"] != DSH_PACKAGE {
+        return None;
+    }
+    manifest["version"].as_str().filter(|v| is_exact_version(v)).map(str::to_string)
+}
+
+/// The version `install` will launch, read just before launching it.
+pub async fn launch_version(install: &DshInstall) -> Option<String> {
+    match install {
+        DshInstall::Pnpm { .. } => installed_version().await.ok(),
+        DshInstall::Npm { prefix, .. } => manifest_version(&prefix.join("lib/node_modules").join(DSH_PACKAGE)),
+    }
 }
 
 /// The profile `dsh plugin` operates on.
@@ -325,12 +566,7 @@ pub fn running_version<P: SystemProbe>(probe: &P, port: u16, launched: Option<La
     if !is_dsh_web_command(&command) {
         return None;
     }
-    let dir = dsh_package_dir(&command)?;
-    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("package.json")).ok()?).ok()?;
-    if manifest["name"] != DSH_PACKAGE {
-        return None;
-    }
-    manifest["version"].as_str().filter(|v| is_exact_version(v)).map(str::to_string)
+    manifest_version(&dsh_package_dir(&command)?)
 }
 
 /// The package directory of the `…/lib/bin.js` entry in a command line,
@@ -397,16 +633,53 @@ pub async fn exact_version(target: &str) -> Option<String> {
     (version == target).then_some(version)
 }
 
-/// Install the newest dsh with pnpm.
-pub async fn update(target: &str) -> Result<ExecOutput, ServerOpError> {
-    let args = if target == "latest" { update_args() } else { update_target_args(target).map_err(ServerOpError::Failed)? };
-    let pnpm = resolve_pnpm()?;
-    // Confirm dsh is a pnpm-managed install *before* touching anything, so we
-    // never "successfully" update a copy that is not the one being launched.
-    resolve_dsh()?;
-    host_exec::run(&pnpm, &args, None, &HashMap::new(), host_exec::INSTALL_TIMEOUT)
+/// Install `target` into the install `resolve_install` classified.
+pub async fn update(install: &DshInstall, target: &str) -> Result<ExecOutput, ServerOpError> {
+    match install {
+        DshInstall::Pnpm { .. } => {
+            let args = if target == "latest" { update_args() } else { update_target_args(target).map_err(ServerOpError::Failed)? };
+            let pnpm = resolve_pnpm()?;
+            // Confirm dsh is a pnpm-managed install *before* touching anything, so we
+            // never "successfully" update a copy that is not the one being launched.
+            resolve_dsh()?;
+            host_exec::run(&pnpm, &args, None, &HashMap::new(), host_exec::INSTALL_TIMEOUT)
+                .await
+                .map_err(|e| ServerOpError::Failed(e.message()))
+        }
+        DshInstall::Npm { prefix, npm, .. } => {
+            let args = npm_update_args(prefix, target).map_err(ServerOpError::Failed)?;
+            let env = install.env();
+            if !npm_root_requires_admin(prefix) {
+                return host_exec::run(npm, &args, None, &env, host_exec::INSTALL_TIMEOUT)
+                    .await
+                    .map_err(|e| ServerOpError::Failed(e.message()));
+            }
+            let path_env = env.get("PATH").cloned().unwrap_or_default();
+            update_as_admin(prefix, npm, &args, &path_env).await
+        }
+    }
+}
+
+/// The privileged npm install, through the macOS authorization dialog.
+#[cfg(target_os = "macos")]
+async fn update_as_admin(_prefix: &Path, npm: &Path, args: &[String], path_env: &str) -> Result<ExecOutput, ServerOpError> {
+    let script = admin_apple_script(&privileged_command(npm, &privileged_args(args), path_env));
+    let out = host_exec::run(Path::new("/usr/bin/osascript"), &["-e".to_string(), script], None, &HashMap::new(), ADMIN_INSTALL_TIMEOUT)
         .await
-        .map_err(|e| ServerOpError::Failed(e.message()))
+        .map_err(|e| ServerOpError::Failed(e.message()))?;
+    // osascript reports a dismissed dialog as "User canceled. (-128)".
+    if out.exit_code != Some(0) && out.stderr.contains("(-128)") {
+        return Err(ServerOpError::AuthorizationCancelled);
+    }
+    Ok(out)
+}
+
+/// Elsewhere there is no dialog to ask with: say what to run instead.
+#[cfg(not(target_os = "macos"))]
+async fn update_as_admin(prefix: &Path, npm: &Path, args: &[String], _path_env: &str) -> Result<ExecOutput, ServerOpError> {
+    let command = std::iter::once(format!("sudo {}", shell_quoted(&npm.to_string_lossy())))
+        .chain(args.iter().map(|a| shell_quoted(a))).collect::<Vec<_>>().join(" ");
+    Err(ServerOpError::NpmRootNotWritable { root: prefix.join("lib/node_modules").to_string_lossy().into_owned(), command })
 }
 
 /// Everything the restart needs from the operating system.

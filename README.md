@@ -208,11 +208,28 @@ the header is always present. `GET` now answers 405 naming the right method.
 A non-zero subprocess exit is returned as HTTP 200 with an `exitCode`, because
 the UI needs git's own stderr rather than a generic 500.
 
-### dsh is resolved through pnpm, by shim path
+### dsh is resolved from the running server: npm prefix or pnpm shim
 
-`/host/server/*` runs `$PNPM_HOME/dsh`, never whatever `dsh` is first on
-`PATH`, and never the path that shim resolves to. Both rules exist because of
-measured failure modes:
+`/host/server/*` acts on the install the `dsh web` on the managed port is
+running from, never whatever `dsh` is first on `PATH`:
+
+- **npm global install** (`<prefix>/lib/node_modules/@deepseek-ai/dsh`, linked as
+  `<prefix>/bin/dsh`): update runs `npm install --global --prefix <prefix>`
+  and restart launches `<prefix>/bin/dsh`, both with the server's own Node first
+  on `PATH`. A prefix this user cannot write (the official Node .pkg's
+  `/usr/local`) is installed through the macOS authorization dialog, as the Mac
+  app does, with a separate npm cache so root never writes into `~/.npm`;
+  dismissing the dialog returns 400 with `reason: "authorization-cancelled"`.
+  Other platforms report the `sudo` command to run instead. The install runs
+  in its own task and is never killed by a timeout or a client that gives up:
+  a root npm interrupted after authorization leaves a half-extracted package
+  and no bin link.
+- **anything else** keeps the pnpm resolution below. A copy that is neither a
+  global npm nor a pnpm install (an npx cache, a project's node_modules) is
+  refused rather than updating some other copy.
+
+For pnpm, `$PNPM_HOME/dsh` is run verbatim, never the path that shim resolves
+to. These rules exist because of measured failure modes:
 
 - A machine can carry two installs (say an npm-global copy earlier on `PATH`
   plus the pnpm one). Updating with pnpm while launching from `PATH` updates one
@@ -222,16 +239,19 @@ measured failure modes:
   every reinstall. A resolved inner path is therefore valid only until the next
   update — exactly when a restart tends to be requested.
 
-When dsh is not a pnpm install, these routes return 400 with
-`reason: "dsh-not-installed-via-pnpm"` rather than falling back.
+When no npm-installed server is running and dsh is not a pnpm install, these
+routes return 400 with `reason: "dsh-not-installed-via-pnpm"` rather than
+falling back.
 
 `/host/server/version` reports the version of the `dsh web` actually running,
 so an update that has not been restarted into still shows the old version. A
 server this daemon restarted reports the `dsh --version` recorded just before
 launching it (an in-place install rewrites the package under a running
 process); any other is read from the package its command line runs
-(`…/@deepseek-ai/dsh/lib/bin.js`, or the one a `dsh` bin link resolves to). Only when no server can be read does it fall
-back to `$PNPM_HOME/dsh --version`.
+(`…/@deepseek-ai/dsh/lib/bin.js`, or the one a `dsh` bin link resolves to). An
+update records the running server's version before installing, for the same
+reason. Only when no server can be read does it fall back to
+`$PNPM_HOME/dsh --version`.
 
 ### The guard, and what it does not cover
 

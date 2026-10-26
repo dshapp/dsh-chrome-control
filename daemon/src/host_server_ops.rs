@@ -28,7 +28,7 @@
 include!("host_server_ops_update_tests.rs");
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::host_exec::{self, ExecError, ExecOutput};
@@ -125,9 +125,44 @@ pub fn resolve_pnpm_home() -> Option<PathBuf> {
     fallback.is_dir().then_some(fallback)
 }
 
-/// `$HOME`, or `None` when the environment does not say.
+/// The user's home directory, or `None` when the environment does not say.
+///
+/// `$HOME` comes first: on Unix it is the authority, and a Windows user who
+/// exported one (Git Bash, MSYS) chose it on purpose. Windows itself does not
+/// set `HOME` — its home is `%USERPROFILE%`, or `%HOMEDRIVE%%HOMEPATH%` — and
+/// dsh hands the daemon a plain Windows environment. Reading only `HOME` made
+/// every `/host/git` call there fail with "cannot determine HOME"; the
+/// extension reads that as "not a repository" and the chat header's Git entry
+/// (branch + `+a −r`) never appeared on Windows.
 pub fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
+    home_from(|key| std::env::var_os(key), cfg!(windows))
+}
+
+/// [`dirs_home`] over an injectable environment, so the Windows fallback is
+/// testable on every platform.
+fn home_from(var: impl Fn(&str) -> Option<std::ffi::OsString>, windows: bool) -> Option<PathBuf> {
+    let non_empty = |key: &str| var(key).filter(|value| !value.is_empty());
+    if let Some(home) = non_empty("HOME") {
+        // A Unix-style `HOME` leaking into a Windows process (`/c/Users/x`) is
+        // not a path Windows can resolve; fall through to the native variables
+        // instead of rejecting every cwd as "outside home".
+        if !windows || Path::new(&home).is_absolute() {
+            return Some(PathBuf::from(home));
+        }
+    }
+    if !windows {
+        return None;
+    }
+    if let Some(profile) = non_empty("USERPROFILE") {
+        return Some(PathBuf::from(profile));
+    }
+    match (non_empty("HOMEDRIVE"), non_empty("HOMEPATH")) {
+        (Some(mut drive), Some(path)) => {
+            drive.push(path);
+            Some(PathBuf::from(drive))
+        }
+        _ => None,
+    }
 }
 
 /// The `dsh` executable to run: the pnpm shim, by path, unresolved.
@@ -525,6 +560,49 @@ impl SystemProbe for RealSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env_of(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        move |key| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| std::ffi::OsString::from(*v))
+    }
+
+    #[test]
+    fn home_prefers_home_everywhere() {
+        let env = env_of(&[("HOME", "/Users/me"), ("USERPROFILE", "C:\\Users\\other")]);
+        assert_eq!(home_from(&env, false), Some(PathBuf::from("/Users/me")));
+    }
+
+    #[test]
+    fn home_on_unix_does_not_borrow_windows_variables() {
+        let env = env_of(&[("USERPROFILE", "C:\\Users\\me")]);
+        assert_eq!(home_from(&env, false), None);
+    }
+
+    #[test]
+    fn home_on_windows_falls_back_to_userprofile() {
+        // The environment dsh hands the daemon on a stock Windows machine.
+        let env = env_of(&[("USERPROFILE", "C:\\Users\\me"), ("HOMEDRIVE", "D:"), ("HOMEPATH", "\\x")]);
+        assert_eq!(home_from(&env, true), Some(PathBuf::from("C:\\Users\\me")));
+    }
+
+    #[test]
+    fn home_on_windows_falls_back_to_homedrive_and_homepath() {
+        let env = env_of(&[("HOME", ""), ("USERPROFILE", ""), ("HOMEDRIVE", "C:"), ("HOMEPATH", "\\Users\\me")]);
+        assert_eq!(home_from(&env, true), Some(PathBuf::from("C:\\Users\\me")));
+    }
+
+    #[test]
+    fn home_is_none_when_nothing_is_set() {
+        assert_eq!(home_from(env_of(&[]), true), None);
+        assert_eq!(home_from(env_of(&[("HOMEDRIVE", "C:")]), true), None);
+    }
+
+    /// Only meaningful where `/c/Users/me` is not absolute.
+    #[cfg(windows)]
+    #[test]
+    fn home_on_windows_skips_a_unix_style_home() {
+        let env = env_of(&[("HOME", "/c/Users/me"), ("USERPROFILE", "C:\\Users\\me")]);
+        assert_eq!(home_from(&env, true), Some(PathBuf::from("C:\\Users\\me")));
+    }
 
     struct FakeSystem {
         pid: Option<u32>,

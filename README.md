@@ -44,10 +44,12 @@ dsh plugin --profile web add dsh-chrome-control     # or a link: dependency for 
 Then **install the browser extension yourself** from the
 [Chrome Web Store — Deepseek Harness APP](https://chromewebstore.google.com/detail/deepseek-harness-app/kgjjicancjnedmappjhefngdjaommpop)
 (click *Add to Chrome*). Installing an extension is a decision only the
-browser's owner can make, so nothing does it for you. Point the extension's *DSH server* address at the same `dsh web` URL (default
-`http://127.0.0.1:3080`); it derives the bridge socket `ws(s)://…/chrome/ws`
-from it. Until it is connected, every tool returns a message saying exactly
-that.
+browser's owner can make, so nothing does it for you. No address needs
+configuring: the extension's bridge socket connects straight to the daemon at
+`ws://127.0.0.1:37086/chrome/ws`, not to `dsh web`. Its *DSH server* setting
+(default `http://127.0.0.1:3080`) is the `dsh web` URL the side panel and the
+Native Messaging autostart use; it does not move the bridge socket. Until the
+extension is connected, every tool returns a message saying exactly that.
 
 ## Native Messaging host (installed on every boot)
 

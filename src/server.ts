@@ -27,6 +27,7 @@ import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
 import * as McpClient from '@deepseek-ai/dsh-mcp-client'
+import { DAEMON_MCP_URL, DAEMON_PORT } from './daemon.ts'
 import { installNativeHost } from './native-host.ts'
 // Type-only: contributes the `webServer` service augmentation to Context.
 import type {} from '@deepseek-ai/dsh-host-webserver'
@@ -37,11 +38,9 @@ export const name = 'chrome-server'
 /** The bridge cannot mount routes before the web server exists. */
 export const inject = ['webServer']
 
-/** The daemon's fixed port. The extension's `dsh_chrome_url` default matches. */
-export const DAEMON_PORT = 37086
+export { DAEMON_PORT } from './daemon.ts'
 
-/** Where the daemon's routes live. */
-const MCP_PATH = '/chrome/mcp'
+/** Where the daemon's other routes live. */
 const STATUS_PATH = '/chrome/status'
 const SHUTDOWN_PATH = '/chrome/shutdown'
 
@@ -58,7 +57,7 @@ export function bridgeConfig(): McpClient.StreamableHttpConfig {
   return {
     serverName: 'chrome',
     transport: 'streamable-http',
-    url: `http://127.0.0.1:${DAEMON_PORT}${MCP_PATH}`,
+    url: DAEMON_MCP_URL,
     headers: {},
     // Above the hub's own 30 s timeout, so its actionable message wins the race.
     toolCallTimeoutMs: 35_000,

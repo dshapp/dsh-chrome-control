@@ -348,7 +348,56 @@ pub fn validate_cwd(raw: &str, home: &Path) -> Result<PathBuf, String> {
     if !resolved.starts_with(&home_resolved) {
         return Err(format!("cwd must be inside {}: {raw}", home_resolved.display()));
     }
-    Ok(resolved)
+    Ok(simplify_verbatim(resolved))
+}
+
+/// Undo the verbatim spelling Windows' `canonicalize` answers in.
+///
+/// `canonicalize` returns `\\?\C:\…` (or `\\?\UNC\server\share\…`) on Windows.
+/// That form is right for the containment check above — both sides come out of
+/// `canonicalize` — but it is a poor working directory to hand a child: git
+/// would see `\\?\C:\…` as its cwd and spell paths back in that form, and
+/// tools that do not expect the prefix mis-resolve it. The child gets the
+/// ordinary spelling instead.
+///
+/// Only when that spelling means the same directory: verbatim paths skip
+/// Win32 normalization, so a path that is too long, ends a component in `.` or
+/// a space, or names a DOS device (`CON`, `NUL`, …) is left verbatim. A path
+/// without the prefix (every Unix path) is returned untouched.
+pub fn simplify_verbatim(path: PathBuf) -> PathBuf {
+    let Some(text) = path.to_str() else { return path };
+    let simplified = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        let bytes = rest.as_bytes();
+        let is_disk = bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\';
+        if !is_disk {
+            return path;
+        }
+        rest.to_string()
+    } else {
+        return path;
+    };
+    // MAX_PATH (260) counts the terminating NUL.
+    if simplified.len() >= 260 {
+        return path;
+    }
+    let reserved = |name: &str| {
+        let stem = name.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+        matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+            || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+                && stem.len() == 4
+                && stem.as_bytes()[3].is_ascii_digit())
+    };
+    let unsafe_component = simplified
+        .split('\\')
+        .skip(1)
+        .filter(|c| !c.is_empty())
+        .any(|c| c.ends_with('.') || c.ends_with(' ') || reserved(c));
+    if unsafe_component {
+        return path;
+    }
+    PathBuf::from(simplified)
 }
 
 /// Environment for git: never prompt.
@@ -594,7 +643,56 @@ mod tests {
         let inner = home.join("repo");
         std::fs::create_dir_all(&inner).unwrap();
         let got = validate_cwd(inner.to_str().unwrap(), &home).unwrap();
-        assert_eq!(got, inner.canonicalize().unwrap());
+        assert_eq!(got, simplify_verbatim(inner.canonicalize().unwrap()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cwd_is_handed_to_git_without_the_verbatim_prefix() {
+        let home = std::env::temp_dir().join("dsh-host-exec-verbatim");
+        let inner = home.join("repo");
+        std::fs::create_dir_all(&inner).unwrap();
+        let got = validate_cwd(inner.to_str().unwrap(), &home).unwrap();
+        assert!(!got.to_string_lossy().starts_with(r"\\?\"), "{}", got.display());
+    }
+
+    #[test]
+    fn verbatim_disk_paths_lose_the_prefix() {
+        let got = simplify_verbatim(PathBuf::from(r"\\?\C:\Users\me\repo"));
+        assert_eq!(got, PathBuf::from(r"C:\Users\me\repo"));
+        assert_eq!(simplify_verbatim(PathBuf::from(r"\\?\D:\")), PathBuf::from(r"D:\"));
+    }
+
+    #[test]
+    fn verbatim_unc_paths_become_plain_unc() {
+        let got = simplify_verbatim(PathBuf::from(r"\\?\UNC\server\share\repo"));
+        assert_eq!(got, PathBuf::from(r"\\server\share\repo"));
+    }
+
+    #[test]
+    fn verbatim_paths_that_would_change_meaning_are_kept() {
+        for raw in [
+            r"\\?\C:\Users\me\trailing.",
+            r"\\?\C:\Users\me\trailing ",
+            r"\\?\C:\Users\me\CON",
+            r"\\?\C:\Users\me\nul.txt",
+            r"\\?\C:\Users\me\com1",
+            r"\\?\Volume{0000}\repo",
+            r"\\?\C:relative",
+        ] {
+            assert_eq!(simplify_verbatim(PathBuf::from(raw)), PathBuf::from(raw), "{raw}");
+        }
+        let long = format!(r"\\?\C:\{}", "a".repeat(300));
+        assert_eq!(simplify_verbatim(PathBuf::from(&long)), PathBuf::from(&long));
+    }
+
+    #[test]
+    fn plain_paths_are_untouched() {
+        assert_eq!(simplify_verbatim(PathBuf::from("/Users/me/repo")), PathBuf::from("/Users/me/repo"));
+        assert_eq!(simplify_verbatim(PathBuf::from(r"C:\Users\me")), PathBuf::from(r"C:\Users\me"));
+        // A component that merely starts like a device name is an ordinary name.
+        let ok = simplify_verbatim(PathBuf::from(r"\\?\C:\console\com10\auxiliary"));
+        assert_eq!(ok, PathBuf::from(r"C:\console\com10\auxiliary"));
     }
 
     #[test]

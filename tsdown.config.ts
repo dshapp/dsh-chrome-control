@@ -7,7 +7,7 @@ import { defineConfig } from 'tsdown'
  * and bundling would duplicate their code and strand transitive imports.
  */
 export default defineConfig({
-  entry: ['src/server.ts', 'src/skills.ts'],
+  entry: ['src/server.ts', 'src/skills.ts', 'src/web-search.ts'],
   outDir: 'lib',
   format: ['esm'],
   platform: 'node',

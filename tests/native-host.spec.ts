@@ -8,6 +8,7 @@
 
 import { spawn } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync, existsSync } from 'node:fs'
+import * as net from 'node:net'
 import { tmpdir } from 'node:os'
 import * as path from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -183,6 +184,133 @@ describe('native host: protocol', () => {
     const r = await host([CALLER], { cmd: 'start', target: 'web', host: '0.0.0.0', port: 3080 })
     expect(r.body).toMatchObject({ ok: false, reason: 'host-not-loopback' })
   })
+
+  it('advertises restart in status, so the extension knows not to fall back to the daemon', async () => {
+    expect((await host([CALLER])).body?.commands).toContain('restart')
+  })
+
+  it('will not restart dsh on a non-loopback host, nor an unknown target', async () => {
+    expect((await host([CALLER], { cmd: 'restart', target: 'web', host: '0.0.0.0', port: 3080 })).body)
+      .toMatchObject({ ok: false, reason: 'host-not-loopback' })
+    expect((await host([CALLER], { cmd: 'restart', target: 'daemon' })).body).toEqual({ ok: false, reason: 'unknown-target' })
+  })
+})
+
+describe.runIf(process.platform !== 'win32')('native host: restart', () => {
+  /**
+   * A stand-in for `dsh`: `dsh web --port N` listens on N until signalled.
+   * FAKE_DSH_STUBBORN makes it ignore SIGTERM, the way a wedged server would.
+   */
+  const FAKE_DSH = [
+    '#!/usr/bin/env node',
+    "const net = require('node:net')",
+    "const port = Number(process.argv[process.argv.indexOf('--port') + 1])",
+    "if (process.env.FAKE_DSH_STUBBORN) process.on('SIGTERM', () => {})",
+    "net.createServer(s => s.end()).listen(port, '127.0.0.1')",
+  ].join('\n')
+
+  function fakeDsh() {
+    const dir = mkdtempSync(path.join(tmpdir(), 'dsh-restart-'))
+    const bin = path.join(dir, 'dsh')
+    writeFileSync(bin, FAKE_DSH, { mode: 0o755 })
+    const env = { ...process.env, DSH_BIN: bin, DSH_HOME: path.join(dir, 'home') }
+    return { bin, env }
+  }
+
+  async function freePort(): Promise<number> {
+    const server = net.createServer()
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', () => resolve()))
+    const port = (server.address() as net.AddressInfo).port
+    await new Promise(resolve => server.close(resolve))
+    return port
+  }
+
+  async function listening(port: number): Promise<boolean> {
+    return await new Promise(resolve => {
+      const socket = net.connect(port, '127.0.0.1')
+      socket.once('connect', () => { socket.destroy(); resolve(true) })
+      socket.once('error', () => resolve(false))
+    })
+  }
+
+  async function until(check: () => Promise<boolean>, budgetMs = 5000) {
+    const deadline = Date.now() + budgetMs
+    while (Date.now() < deadline) {
+      if (await check()) return true
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+    return false
+  }
+
+  function alive(pid: number) {
+    try { process.kill(pid, 0); return true } catch { return false }
+  }
+
+  /** Bring up a server the host did not start, the way a user's terminal would. */
+  async function runningServer(bin: string, port: number, env: NodeJS.ProcessEnv = process.env) {
+    const child = spawn(bin, ['web', '--no-open', '--host', '127.0.0.1', '--port', String(port)], { env, stdio: 'ignore', detached: true })
+    child.unref()
+    expect(await until(() => listening(port))).toBe(true)
+    return child.pid!
+  }
+
+  const restart = (port: number, env: NodeJS.ProcessEnv) =>
+    run(process.execPath, [HOST, CALLER], frame(JSON.stringify({ cmd: 'restart', target: 'web', host: '127.0.0.1', port })), env)
+
+  it('stops the server on the port and brings a new one up at the same address', async () => {
+    const { bin, env } = fakeDsh()
+    const port = await freePort()
+    const old = await runningServer(bin, port)
+    const r = await restart(port, env)
+    try {
+      expect(r.body).toMatchObject({ ok: true, stopped: true, previousPid: old, port })
+      expect(r.body.pid).not.toBe(old)
+      expect(alive(old)).toBe(false)
+      expect(await listening(port)).toBe(true)
+      expect(existsSync(r.body.log)).toBe(true)
+    } finally {
+      if (r.body?.pid) try { process.kill(r.body.pid, 'SIGKILL') } catch {}
+    }
+  }, 30_000)
+
+  it('escalates to SIGKILL when the server ignores SIGTERM', async () => {
+    const { bin, env } = fakeDsh()
+    const port = await freePort()
+    const old = await runningServer(bin, port, { ...process.env, FAKE_DSH_STUBBORN: '1' })
+    const r = await restart(port, env)
+    try {
+      expect(r.body).toMatchObject({ ok: true, stopped: true, previousPid: old })
+      expect(alive(old)).toBe(false)
+    } finally {
+      if (r.body?.pid) try { process.kill(r.body.pid, 'SIGKILL') } catch {}
+    }
+  }, 30_000)
+
+  it('starts a server when none is running: a restart still ends with one up', async () => {
+    const { env } = fakeDsh()
+    const port = await freePort()
+    const r = await restart(port, env)
+    try {
+      expect(r.body).toMatchObject({ ok: true, stopped: false, previousPid: null, port })
+      expect(await listening(port)).toBe(true)
+    } finally {
+      if (r.body?.pid) try { process.kill(r.body.pid, 'SIGKILL') } catch {}
+    }
+  }, 30_000)
+
+  it('never kills something on the port that is not dsh web', async () => {
+    const { env } = fakeDsh()
+    const server = net.createServer(s => s.end())
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', () => resolve()))
+    const port = (server.address() as net.AddressInfo).port
+    try {
+      const r = await restart(port, env)
+      expect(r.body).toMatchObject({ ok: false, reason: 'not-dsh-web', pid: process.pid })
+      expect(await listening(port)).toBe(true)
+    } finally {
+      await new Promise(resolve => server.close(resolve))
+    }
+  }, 30_000)
 })
 
 describe('extension id has one value everywhere', () => {

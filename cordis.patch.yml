@@ -1,4 +1,4 @@
-# dsh-chrome bundle: two rows that together give the agent control of the
+# dsh-chrome bundle: three rows that together give the agent control of the
 # user's real Chrome.
 #
 #   1. the server row mounts the extension bridge on the harness's own web
@@ -7,7 +7,11 @@
 #      loads the in-box mcp-client bridge against its own /chrome/mcp — using
 #      the web server's *actual* listening port, so no port is written here —
 #      which publishes the catalog as mcp__chrome__* with no adapter code;
-#   2. the skills row teaches the agent how to drive those tools.
+#   2. the skills row teaches the agent how to drive those tools;
+#   3. the web-search row registers the `chrome-browser` provider for the
+#      built-in web_search tool. It stays unused (off) until the user sets
+#      `web.searchProvider: chrome-browser`; `engine` picks Google (default),
+#      Bing, Baidu, Sogou, or Toutiao.
 #
 # The browser extension is installed by the user, by design: loading an
 # unpacked extension is a decision only the browser's owner can make. Point
@@ -18,3 +22,6 @@
 
     - id: chrome-skills
       name: 'dsh-chrome-control/skills'
+
+    - id: chrome-web-search
+      name: 'dsh-chrome-control/web-search'

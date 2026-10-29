@@ -63,8 +63,20 @@ there is no separate installer to run:
 $DSH_HOME/native-host/dsh-native-host.mjs   the host (copied from native-host/ in this package)
 $DSH_HOME/native-host/dsh-native-host       launcher Chrome executes; absolute node, forwards argv
 $DSH_HOME/native-host/config.json           node + entry of the dsh that booted, used to start it again
+$DSH_HOME/native-host/launchd/com.dsh.chrome.web.<port>.plist   macOS: the one-shot launchd job dsh web runs in
 <browser>/NativeMessagingHosts/com.dsh.chrome.json   for each Chromium-family browser present
 ```
+
+On **macOS** the host does not fork `dsh web` itself: it loads it as a one-shot
+job in the `gui/<uid>` launchd domain (`RunAtLoad`, no `KeepAlive`, not in
+`~/Library/LaunchAgents`, so nothing starts at login). The host is a child of
+Chrome, whose `LSFileQuarantineEnabled` puts its whole process tree under file
+quarantine — a server forked from here would stamp
+`com.apple.quarantine …;Chrome;` on every file it and its agents write, and
+Gatekeeper then kills freshly built ad-hoc binaries (an `npm ci`'d esbuild, a
+SwiftPM `*-manifest`). If launchd refuses (no GUI session), or
+`DSH_NATIVE_HOST_NO_LAUNCHD` is set, it falls back to a detached spawn; the reply
+says which (`launcher: "launchd" | "spawn"`).
 
 `<browser>` is `~/Library/Application Support/<vendor>` on macOS and
 `$XDG_CONFIG_HOME/<browser>` (default `~/.config`) on **Linux**: `google-chrome`

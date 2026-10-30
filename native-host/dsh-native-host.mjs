@@ -24,9 +24,11 @@
  * plus a read-only `status` probe for the extension's settings page.
  *
  * One request per process: Chrome writes one message (4-byte LE length +
- * JSON) on stdin, this writes one reply and exits. A started server is
- * spawned detached and unref'd, because Native Messaging kills the host the
- * moment the reply is flushed.
+ * JSON) on stdin, this writes one reply and exits. A started server must
+ * outlive the host, because Native Messaging kills the host the moment the
+ * reply is flushed: on macOS it is handed to launchd (which also keeps it out
+ * of Chrome's file-quarantine process tree, see launchWeb), elsewhere it is
+ * spawned detached and unref'd.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -299,15 +301,39 @@ async function startWeb(opts) {
   return await launchWeb(host, port);
 }
 
-/** 起一个新的 dsh web 并等端口就绪。不先探活 —— 调用方已经确认端口空着。 */
+/**
+ * 起一个新的 dsh web 并等端口就绪。不先探活 —— 调用方已经确认端口空着。
+ *
+ * macOS 上交给 launchd 起,不直接 spawn。本宿主是 Chrome 的子进程,而 Chrome 的
+ * Info.plist 开着 LSFileQuarantineEnabled:它这一支进程树(detached / setsid 也
+ * 甩不掉)写出的每个新文件都会被内核打上 `com.apple.quarantine …;Chrome;`。
+ * dsh web 若直接从这里 fork 出去,它和它跑的所有 agent、npm ci、swift build 就全
+ * 在这棵树里 —— 新解出来的 esbuild、新链接出来的 SwiftPM manifest 等 ad-hoc 签名
+ * 的可执行文件一跑就被 Gatekeeper 拦("Apple could not verify …" / Killed: 9)。
+ * launchd 起的进程是 launchd 的孩子,不继承这个隔离属性。launchd 不可用时(比如
+ * 不在 GUI 会话里)退回原来的 spawn。
+ */
 async function launchWeb(host, port) {
   const launch = resolveLaunch();
   const logPath = path.join(logDir(), "dsh-web.log");
+  const argv = [...launch.args, "web", "--no-open", "--host", String(host), "--port", String(port)];
+  let launchdError = null;
+  if (process.platform === "darwin" && !process.env.DSH_NATIVE_HOST_NO_LAUNCHD) {
+    const viaLaunchd = await launchWebViaLaunchd(launch.command, argv, logPath, port);
+    if (viaLaunchd.ok) {
+      const up = await waitForPort(port, host, 20000);
+      const pid = up ? await listeningPid(port) : null;
+      return up
+        ? { ok: true, pid, host, port, log: logPath, launcher: "launchd", label: viaLaunchd.label }
+        : { ok: false, pid, host, port, log: logPath, launcher: "launchd", label: viaLaunchd.label, reason: "port-stayed-down" };
+    }
+    launchdError = viaLaunchd.error;
+  }
   let logFd = null;
   try { logFd = fs.openSync(logPath, "a"); } catch {}
   const out = logFd != null ? logFd : "ignore";
   const err = logFd != null ? logFd : "ignore";
-  const spec = spawnSpec(launch.command, [...launch.args, "web", "--no-open", "--host", String(host), "--port", String(port)]);
+  const spec = spawnSpec(launch.command, argv);
   const child = spawn(spec.command, spec.args, {
     ...spec.options,
     detached: true,
@@ -319,9 +345,115 @@ async function launchWeb(host, port) {
   try { child.on("error", () => {}); } catch {}
   const pid = child.pid ?? null;
   const up = await waitForPort(port, host, 20000);
+  const extra = launchdError ? { launcher: "spawn", launchdError } : { launcher: "spawn" };
   return up
-    ? { ok: true, pid, host, port, log: logPath }
-    : { ok: false, pid, host, port, log: logPath, reason: "port-stayed-down" };
+    ? { ok: true, pid, host, port, log: logPath, ...extra }
+    : { ok: false, pid, host, port, log: logPath, ...extra, reason: "port-stayed-down" };
+}
+
+/** 每个端口一个 launchd 任务:同一端口重启时先 bootout 旧任务再装新的,不同端口互不影响。 */
+function launchdLabel(port) {
+  return `com.dsh.chrome.web.${port}`;
+}
+
+/** 跑一个命令,回 { code, stdout, stderr };命令不存在时 code 为 null。 */
+function runTool(command, args, timeoutMs = 10000) {
+  return new Promise((resolve) => {
+    execFile(command, args, { timeout: timeoutMs }, (error, stdout, stderr) => {
+      const code = error ? (typeof error.code === "number" ? error.code : null) : 0;
+      resolve({ code, stdout: String(stdout || ""), stderr: String(stderr || error?.message || "") });
+    });
+  });
+}
+
+function xmlEscape(value) {
+  return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+/**
+ * launchd 任务的环境:沿用本宿主的(PATH 等,dsh 要靠它找 node / git),去掉 Chrome
+ * 的身份变量 —— __CFBundleIdentifier / XPC_SERVICE_NAME 留着会让 dsh 及其子进程
+ * 看起来像 Chrome 起的。
+ */
+function launchdEnvironment() {
+  const env = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value == null || key.startsWith("__CF") || key.startsWith("XPC_")) continue;
+    env[key] = value;
+  }
+  return env;
+}
+
+function launchdPlist(label, programArguments, logPath) {
+  const strings = (values) => values.map((value) => `    <string>${xmlEscape(value)}</string>`).join("\n");
+  const env = Object.entries(launchdEnvironment())
+    .map(([key, value]) => `    <key>${xmlEscape(key)}</key>\n    <string>${xmlEscape(value)}</string>`)
+    .join("\n");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${xmlEscape(label)}</string>
+  <key>ProgramArguments</key>
+  <array>
+${strings(programArguments)}
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+${env}
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>${xmlEscape(os.homedir())}</string>
+  <key>StandardOutPath</key>
+  <string>${xmlEscape(logPath)}</string>
+  <key>StandardErrorPath</key>
+  <string>${xmlEscape(logPath)}</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+  <key>AbandonProcessGroup</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+</dict>
+</plist>
+`;
+}
+
+/**
+ * 把 dsh web 装成 gui/<uid> 域里的一次性 launchd 任务并立即起跑(RunAtLoad,
+ * 不 KeepAlive:退出了就是退出了,和原来的 detached spawn 一样)。plist 放在
+ * $DSH_HOME/native-host/launchd/ 而不是 ~/Library/LaunchAgents,登录时不会自启。
+ * 进程退出后任务仍挂在 launchd 里,下次同端口启动前先 bootout 掉。
+ */
+async function launchWebViaLaunchd(command, args, logPath, port) {
+  const launchctl = "/bin/launchctl";
+  if (!fs.existsSync(launchctl) || typeof process.getuid !== "function") return { ok: false, error: "launchctl-unavailable" };
+  const label = launchdLabel(port);
+  const domain = `gui/${process.getuid()}`;
+  // launchd 不按 PATH 找程序:裸名(resolveDsh 的最后退路 "dsh")经 env 找。
+  const programArguments = path.isAbsolute(command) ? [command, ...args] : ["/usr/bin/env", command, ...args];
+  const dir = path.join(dshHome(), "native-host", "launchd");
+  const plistPath = path.join(dir, `${label}.plist`);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(plistPath, launchdPlist(label, programArguments, logPath));
+  } catch (error) {
+    return { ok: false, error: `plist-write-failed: ${error?.message || error}` };
+  }
+  // 本进程写的文件同样带着 quarantine;清掉,免得 launchd 对 plist 有意见。
+  await runTool("/usr/bin/xattr", ["-d", "com.apple.quarantine", plistPath]);
+  await runTool(launchctl, ["bootout", `${domain}/${label}`]);
+  let boot = await runTool(launchctl, ["bootstrap", domain, plistPath]);
+  if (boot.code !== 0) {
+    // bootout 是异步收尾的,紧接着 bootstrap 偶尔撞上 "Input/output error";稍等再试一次。
+    await sleep(500);
+    boot = await runTool(launchctl, ["bootstrap", domain, plistPath]);
+  }
+  if (boot.code !== 0) return { ok: false, error: `bootstrap-failed(${boot.code}): ${boot.stderr.trim().slice(0, 300)}` };
+  return { ok: true, label };
 }
 
 /** SIGTERM 之后给 dsh web 收尾(关会话、带走工具子进程)的时间,超时再 SIGKILL。与 Mac 一致。 */

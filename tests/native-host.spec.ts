@@ -6,12 +6,12 @@
  * real browser directory is touched.
  */
 
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync, existsSync } from 'node:fs'
 import * as net from 'node:net'
 import { tmpdir } from 'node:os'
 import * as path from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 import {
   EXTENSION_ID, NATIVE_HOST_NAME, browserDirs, defaultHostSource, installNativeHost, launcherScript,
   parseRegDefault, windowsBrowsers, windowsLauncherScript, type Registry,
@@ -254,8 +254,20 @@ describe.runIf(process.platform !== 'win32')('native host: restart', () => {
     return child.pid!
   }
 
-  const restart = (port: number, env: NodeJS.ProcessEnv) =>
-    run(process.execPath, [HOST, CALLER], frame(JSON.stringify({ cmd: 'restart', target: 'web', host: '127.0.0.1', port })), env)
+  /** macOS: the host leaves a one-shot launchd job per port; unload each one a test created. */
+  const launchedPorts: number[] = []
+  const launchdJob = (port: number) => `gui/${process.getuid!()}/com.dsh.chrome.web.${port}`
+  afterEach(() => {
+    if (process.platform !== 'darwin') return
+    for (const port of launchedPorts.splice(0)) {
+      try { execFileSync('/bin/launchctl', ['bootout', launchdJob(port)], { stdio: 'ignore' }) } catch {}
+    }
+  })
+
+  const restart = (port: number, env: NodeJS.ProcessEnv) => {
+    launchedPorts.push(port)
+    return run(process.execPath, [HOST, CALLER], frame(JSON.stringify({ cmd: 'restart', target: 'web', host: '127.0.0.1', port })), env)
+  }
 
   it('stops the server on the port and brings a new one up at the same address', async () => {
     const { bin, env } = fakeDsh()
@@ -292,6 +304,33 @@ describe.runIf(process.platform !== 'win32')('native host: restart', () => {
     const r = await restart(port, env)
     try {
       expect(r.body).toMatchObject({ ok: true, stopped: false, previousPid: null, port })
+      expect(await listening(port)).toBe(true)
+    } finally {
+      if (r.body?.pid) try { process.kill(r.body.pid, 'SIGKILL') } catch {}
+    }
+  }, 30_000)
+
+  it.runIf(process.platform === 'darwin')('on macOS hands the server to launchd, outside the browser\'s process tree', async () => {
+    const { env } = fakeDsh()
+    const port = await freePort()
+    // Stand in for Chrome's identity variables: they must not reach the server.
+    const r = await restart(port, { ...env, __CFBundleIdentifier: 'com.google.Chrome', XPC_SERVICE_NAME: 'application.com.google.Chrome.1.2' })
+    expect(r.body).toMatchObject({ ok: true, launcher: 'launchd', label: `com.dsh.chrome.web.${port}` })
+    const job = execFileSync('/bin/launchctl', ['print', launchdJob(port)], { encoding: 'utf8' })
+    expect(job).toMatch(/state = running/)
+    expect(job).toContain(`pid = ${r.body.pid}`)
+    expect(execFileSync('/bin/ps', ['-o', 'ppid=', '-p', String(r.body.pid)], { encoding: 'utf8' }).trim()).toBe('1')
+    const serverEnv = execFileSync('/bin/ps', ['eww', '-o', 'command=', '-p', String(r.body.pid)], { encoding: 'utf8' })
+    expect(serverEnv).not.toContain('com.google.Chrome')
+    expect(serverEnv).toContain(`DSH_BIN=${env.DSH_BIN}`)
+  }, 30_000)
+
+  it('falls back to a detached spawn when launchd is switched off', async () => {
+    const { env } = fakeDsh()
+    const port = await freePort()
+    const r = await restart(port, { ...env, DSH_NATIVE_HOST_NO_LAUNCHD: '1' })
+    try {
+      expect(r.body).toMatchObject({ ok: true, launcher: 'spawn', port })
       expect(await listening(port)).toBe(true)
     } finally {
       if (r.body?.pid) try { process.kill(r.body.pid, 'SIGKILL') } catch {}

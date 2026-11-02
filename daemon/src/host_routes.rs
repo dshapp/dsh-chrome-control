@@ -177,6 +177,9 @@ fn server_op_failure(err: ServerOpError) -> Response {
         ServerOpError::DshNotInstalledViaPnpm => {
             json!({ "error": err.message(), "reason": "dsh-not-installed-via-pnpm" })
         }
+        ServerOpError::AuthorizationCancelled => {
+            json!({ "error": err.message(), "reason": "authorization-cancelled" })
+        }
         _ => json!({ "error": err.message() }),
     };
     (status, Json(body)).into_response()
@@ -308,11 +311,14 @@ async fn server_restart(State(state): State<AppState>, headers: HeaderMap) -> Re
         return (StatusCode::CONFLICT, Json(json!({ "error": "a restart is already running" }))).into_response();
     };
 
-    let dsh = match ops::resolve_dsh() {
-        Ok(path) => path,
+    let port = ops::managed_port();
+    // Classified from the running server, before it stops: the copy relaunched
+    // must be the copy that was running (and that an update just rewrote).
+    let install = match ops::resolve_install(&RealSystem, port) {
+        Ok(install) => install,
         Err(err) => return server_op_failure(err),
     };
-    let port = ops::managed_port();
+    let dsh = install.launcher();
     let pid = match ops::verify_target(&RealSystem, port) {
         Ok(pid) => pid,
         Err(err) => return server_op_failure(err),
@@ -320,7 +326,7 @@ async fn server_restart(State(state): State<AppState>, headers: HeaderMap) -> Re
 
     // What the shim is about to launch, read before anything stops: once
     // running, an in-place reinstall can rewrite the package under it.
-    let launch_version = ops::installed_version().await.ok();
+    let launch_version = ops::launch_version(&install).await;
 
     // Ask first, insist second: SIGTERM lets the server close its sessions.
     // `libc` is a Unix-only dependency, so the signals go through a platform
@@ -341,7 +347,7 @@ async fn server_restart(State(state): State<AppState>, headers: HeaderMap) -> Re
     // Detached, with stdio pointed at a file: the new server must outlive this
     // request, and must not die when the daemon's pipes go away.
     let mut command = std::process::Command::new(&dsh);
-    command.args(ops::web_args("127.0.0.1", port)).stdin(std::process::Stdio::null());
+    command.args(ops::web_args("127.0.0.1", port)).envs(install.env()).stdin(std::process::Stdio::null());
     match log {
         Some(file) => {
             let err_file = match file.try_clone() {
@@ -362,6 +368,25 @@ async fn server_restart(State(state): State<AppState>, headers: HeaderMap) -> Re
     let spawned = command.spawn();
     record_launch(&state, &spawned, launch_version);
     restart_reply(spawned, stopped, port, &log_path).await
+}
+
+/// Record the running server's version before an install can rewrite it.
+///
+/// An npm global install updates the package in place, so once it finishes the
+/// running server's command line points at the *new* manifest, and
+/// `/host/server/version` would report the update as applied before any
+/// restart. Pinning the version now, keyed by pid, keeps reporting what the
+/// process actually loaded — the same record a restart leaves behind.
+fn pin_running_version(state: &AppState, port: u16) {
+    use crate::host_server_ops::SystemProbe;
+    let Some(pid) = RealSystem.pid_on_port(port) else { return };
+    let mut launched = state.launched_dsh.lock().unwrap();
+    if launched.as_ref().is_some_and(|(known, _)| *known == pid) {
+        return;
+    }
+    if let Some(version) = ops::running_version(&RealSystem, port, None) {
+        *launched = Some((pid, version));
+    }
 }
 
 /// Remember which version the new server was launched as, keyed by its pid.
@@ -408,14 +433,31 @@ async fn server_update(State(state): State<AppState>, headers: HeaderMap, body: 
     }
     let locks = state.host_locks.clone();
     let target = match server_target(&body) { Ok(target) => target, Err(reason) => return bad_request(reason) };
-    let Ok(_guard) = locks.update.try_lock() else {
+    let Ok(guard) = locks.update.clone().try_lock_owned() else {
         return (StatusCode::CONFLICT, Json(json!({ "error": "an update is already running" }))).into_response();
     };
+    let port = ops::managed_port();
+    let install = match ops::resolve_install(&RealSystem, port) {
+        Ok(install) => install,
+        Err(err) => return server_op_failure(err),
+    };
+    pin_running_version(&state, port);
     // Intentionally does not restart afterwards: a restart drops the user's
     // live session, so the UI asks first.
-    match ops::update(&target).await {
-        Ok(out) => exec_response(out),
-        Err(err) => server_op_failure(err),
+    //
+    // The install runs in its own task, holding the lock, so a client that
+    // gives up (the extension's own timeout, a closed side panel) drops only
+    // this handler — not the installer. Dropping the handler's future would
+    // kill the child, and an npm killed midway leaves a half-extracted package
+    // with no bin link: observed, and it took the user's `dsh` with it.
+    let task = tokio::spawn(async move {
+        let _guard = guard;
+        ops::update(&install, &target).await
+    });
+    match task.await {
+        Ok(Ok(out)) => exec_response(out),
+        Ok(Err(err)) => server_op_failure(err),
+        Err(err) => server_op_failure(ServerOpError::Failed(format!("update task failed: {err}"))),
     }
 }
 

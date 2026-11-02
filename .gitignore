@@ -1,0 +1,11 @@
+node_modules/
+.DS_Store
+*.log
+.env
+.env.*
+
+# IDE settings
+.idea/
+
+# CI-built per-platform daemon binaries (published in the npm tarball, not in git)
+/binaries/

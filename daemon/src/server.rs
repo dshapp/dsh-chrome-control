@@ -1,0 +1,452 @@
+//! axum router: mounts the three routes the bridge exposes.
+//!
+//!   - `POST /chrome/mcp`   — the MCP Streamable HTTP endpoint;
+//!   - `GET  /chrome/ws`    — the browser extension's WebSocket;
+//!   - `GET  /chrome/status` — liveness and wiring probe;
+//!   - `POST /chrome/shutdown` — cooperative stop, so an upgraded `dsh web`
+//!     can retire a stale daemon it does not own (it has no PID for an orphan
+//!     left behind by an earlier session).
+//!
+//! Every route, `/host/*` included, sits behind [`crate::request_guard`]: the
+//! extension routes admit only the one authorized extension `Origin`, the rest
+//! admit only callers with no `Origin` at all (i.e. not a browser), and any
+//! non-loopback `Host` is refused. Handlers here therefore do no origin checks.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Json, Response};
+use axum::routing::{get, post};
+use axum::Router;
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{json, Value};
+use tokio::sync::Notify;
+use tokio::time::{interval, Duration};
+
+use crate::build_id;
+use crate::hub::{Hub, Outbound, TOOL_TIMEOUT_MS};
+use crate::mcp;
+use crate::protocol::{parse_client_frame, ServerFrame};
+
+/// Keepalive interval for a silent MV3 service worker.
+const PING_INTERVAL_MS: u64 = 30_000;
+/// WebSocket max message size (8 MiB), mirroring the Node fix.
+const WS_MAX_MESSAGE: usize = 8 * 1024 * 1024;
+
+/// Shared state threaded through the router.
+#[derive(Clone)]
+pub struct AppState {
+    pub hub: Hub,
+    pub started_at: Instant,
+    /// Notified by `/chrome/shutdown`; awaited by the graceful-shutdown future.
+    pub shutdown: Arc<Notify>,
+    /// Set by `/host/disable`: the user's switch for the host-operation surface.
+    /// Only `/host/*` consults it, so Chrome control keeps working.
+    pub host_disabled: Arc<AtomicBool>,
+    /// False when the daemon is bound off the loopback, which disables
+    /// `/host/*` entirely — those routes run subprocesses, and no allowlist
+    /// makes that safe to expose to a network.
+    pub host_loopback: bool,
+    /// Serializes restart and update so two of either cannot interleave.
+    pub host_locks: crate::host_routes::HostLocks,
+    /// The `dsh web` this daemon last started, with the version it was launched as.
+    pub launched_dsh: Arc<std::sync::Mutex<Option<crate::host_server_ops::Launched>>>,
+}
+
+/// Build the router, self-contained. Used by tests, where no one drives the
+/// shutdown signal.
+#[cfg(test)]
+pub fn router() -> Router {
+    router_with_shutdown(Arc::new(Notify::new()))
+}
+
+/// A router whose listener is pretended to be off the loopback, so the
+/// `/host/*` refusal can be tested.
+#[cfg(test)]
+pub fn router_non_loopback() -> Router {
+    router_with_options(Arc::new(Notify::new()), false)
+}
+
+/// Build the router, sharing `shutdown` with the caller so a `/chrome/shutdown`
+/// request can stop the server.
+pub fn router_with_shutdown(shutdown: Arc<Notify>) -> Router {
+    router_with_options(shutdown, true)
+}
+
+/// Build the router, stating whether the listener is on the loopback.
+///
+/// `host_loopback` is threaded in from `main` rather than inferred here so the
+/// decision is made once, next to the address actually bound.
+pub fn router_with_options(shutdown: Arc<Notify>, host_loopback: bool) -> Router {
+    let state = AppState {
+        hub: Hub::new(TOOL_TIMEOUT_MS),
+        started_at: Instant::now(),
+        shutdown,
+        host_disabled: Arc::new(AtomicBool::new(false)),
+        host_loopback,
+        host_locks: crate::host_routes::HostLocks::default(),
+        launched_dsh: Arc::default(),
+    };
+    Router::new()
+        .route("/chrome/mcp", post(mcp_handler))
+        .route("/chrome/ws", get(ws_handler))
+        .route("/chrome/status", get(status_handler))
+        .route("/chrome/shutdown", post(shutdown_handler))
+        // Host operations ride their own routes and their own stricter guard.
+        .merge(crate::host_routes::router())
+        // Outermost: runs before any route, including a 404.
+        .layer(axum::middleware::from_fn(crate::request_guard::guard))
+        .with_state(state)
+}
+
+/// MCP requests. A notification yields 202 with an empty body; everything else
+/// answers with `application/json`. GET declines (405).
+async fn mcp_handler(State(state): State<AppState>, body: String) -> Response {
+    let raw: Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(mcp::parse_failure(&e.to_string()))).into_response();
+        }
+    };
+    let response = match mcp::handle(&raw, &state.hub).await {
+        Some(v) => (StatusCode::OK, Json(v)).into_response(),
+        None => StatusCode::ACCEPTED.into_response(),
+    };
+    response
+}
+
+/// Liveness and wiring probe.
+async fn status_handler(State(state): State<AppState>) -> Json<Value> {
+    let (connected, version) = state.hub.extension_state().await;
+    Json(json!({
+        "name": mcp::SERVER_NAME,
+        "version": mcp::server_version(),
+        // Content hash of this process's executable. dsh web compares it with
+        // the binary on disk to detect a daemon left over from an older build;
+        // the version string cannot, because releases do not bump Cargo.toml.
+        "build": build_id::build_hash(),
+        "protocolVersion": mcp::PROTOCOL_VERSION,
+        "running": true,
+        "extension_connected": connected,
+        "extension_version": version,
+        "uptime_seconds": state.started_at.elapsed().as_secs()
+    }))
+}
+
+/// Cooperative shutdown, so an upgraded `dsh web` can retire a stale daemon.
+///
+/// Local callers only (no `Origin`), enforced by the request guard: a web page
+/// cannot stop the daemon, while dsh web and curl may. The reply is sent before
+/// the server winds down.
+async fn shutdown_handler(State(state): State<AppState>) -> Response {
+    tracing::info!("shutdown requested over HTTP");
+    state.shutdown.notify_waiters();
+    (StatusCode::ACCEPTED, "shutting down").into_response()
+}
+
+/// WebSocket upgrade handler for the extension. Only the authorized extension
+/// `Origin` gets this far; the request guard refuses everyone else.
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+    ws.max_message_size(WS_MAX_MESSAGE)
+        .on_upgrade(move |socket| serve_extension(socket, state))
+}
+
+/// Releases one extension connection however [`serve_extension`] ends.
+///
+/// The normal exit calls [`ConnectionTeardown::finish`], which detaches from
+/// the hub synchronously. Anything else — a panic unwinding out of the task —
+/// reaches `Drop`, which does the same work without awaiting. Without this, a
+/// task that died after attaching left the hub holding a socket nobody read:
+/// tool calls kept going out, no answer was ever read back, and since the
+/// pinger dies with the task, nothing would ever notice. That is exactly what
+/// a panicking log write once caused (see `crate::log_sink`).
+struct ConnectionTeardown {
+    hub: Hub,
+    outbound: Outbound,
+    /// The writer and pinger tasks. The writer owns the socket's sink half, so
+    /// the socket is only released once it is gone. Aborted, never awaited: it
+    /// ends when every sender is dropped, and `outbound` still holds one —
+    /// awaiting it parks forever and leaves the connection in CLOSE_WAIT (that
+    /// leaked one file descriptor per reconnect until no WebSocket could be
+    /// served at all, while HTTP went on answering normally).
+    tasks: Vec<tokio::task::AbortHandle>,
+    done: bool,
+}
+
+impl ConnectionTeardown {
+    fn new(hub: Hub, outbound: Outbound) -> Self {
+        Self { hub, outbound, tasks: Vec::new(), done: false }
+    }
+
+    fn track(&mut self, task: tokio::task::AbortHandle) {
+        self.tasks.push(task);
+    }
+
+    /// Orderly teardown: failing waiters and clearing the hub happen before
+    /// this returns, so `/chrome/status` is accurate the moment the socket ends.
+    async fn finish(mut self) {
+        self.done = true;
+        for task in &self.tasks {
+            task.abort();
+        }
+        self.hub.detach(&self.outbound).await;
+    }
+}
+
+impl Drop for ConnectionTeardown {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        for task in &self.tasks {
+            task.abort();
+        }
+        // Drop cannot await, so detach on the runtime. detach is a no-op when a
+        // newer socket has already taken over.
+        let hub = self.hub.clone();
+        let outbound = self.outbound.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move { hub.detach(&outbound).await });
+        }
+    }
+}
+
+/// Pump one extension socket until it closes.
+async fn serve_extension(socket: WebSocket, state: AppState) {
+    // One channel + writer task: frames handed to `outbound` land on the socket.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    let tx = Arc::new(tx);
+    let outbound: Arc<dyn Fn(&ServerFrame) -> bool + Send + Sync> = {
+        let tx = tx.clone();
+        Arc::new(move |frame: &ServerFrame| {
+            let text = serde_json::to_string(frame).unwrap_or_default();
+            tx.send(Message::Text(text.into())).is_ok()
+        })
+    };
+
+    let (mut sink, mut stream) = socket.split();
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if sink.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Armed before attaching, so no exit path — panics included — can leave the
+    // hub dispatching to this socket after it stops being served.
+    let mut teardown = ConnectionTeardown::new(state.hub.clone(), outbound.clone());
+    teardown.track(writer.abort_handle());
+    state.hub.attach(outbound.clone()).await;
+    tracing::info!("chrome extension connected");
+
+    let hub = state.hub.clone();
+    // Set when a ping went out on *this* socket and its pong has not come back.
+    //
+    // Per connection, deliberately. While this lived on the hub, every socket's
+    // pinger probed whichever socket the hub currently held: a superseded one
+    // could never discover its own dead peer, and two pingers racing the one
+    // flag would condemn a healthy socket whose pong was merely slow.
+    let awaiting_pong = Arc::new(AtomicBool::new(false));
+    // Signals that the liveness probe gave up on this peer.
+    let (dead_tx, dead_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut pinger_dead = dead_rx;
+    let pinger = tokio::spawn({
+        let hub = hub.clone();
+        let outbound = outbound.clone();
+        let awaiting_pong = awaiting_pong.clone();
+        async move {
+            let mut tick = interval(Duration::from_millis(PING_INTERVAL_MS));
+            tick.tick().await; // first immediate
+            loop {
+                tick.tick().await;
+                // Superseded: a newer socket owns the extension now, and this
+                // one's peer will never be spoken to again. Nothing about its
+                // TCP connection says so, so it is asked rather than awaited.
+                if !hub.is_live(&outbound).await {
+                    tracing::info!("chrome extension socket superseded; dropping it");
+                    break;
+                }
+                // A missed pong means the peer is gone even though the socket
+                // still looks writable. Stop probing and let the caller tear
+                // the connection down.
+                if awaiting_pong.swap(true, Ordering::SeqCst) {
+                    tracing::warn!("chrome extension missed a liveness probe; dropping the socket");
+                    break;
+                }
+                if !outbound(&ServerFrame::Ping) {
+                    break;
+                }
+            }
+            // The loop only ends when this socket has to go, so one signal here
+            // covers every exit.
+            let _ = dead_tx.send(());
+        }
+    });
+    teardown.track(pinger.abort_handle());
+
+    // Drive incoming messages until the peer closes or the pinger declares it
+    // dead. Racing the two is what makes a half-open socket recoverable: the
+    // read half of such a socket simply never wakes up.
+    loop {
+        let msg = tokio::select! {
+            m = stream.next() => m,
+            _ = &mut pinger_dead => None,
+        };
+        match msg {
+            Some(Ok(msg)) => {
+                if let Message::Text(text) = msg {
+                    if let Some(frame) = parse_client_frame(text.as_str()) {
+                        match frame {
+                            crate::protocol::ClientFrame::Hello { extension_version } => {
+                                tracing::info!("hello from extension {extension_version}");
+                                hub.record_hello(extension_version).await;
+                                let _ = outbound(&ServerFrame::HelloAck);
+                            }
+                            crate::protocol::ClientFrame::Pong => {
+                                awaiting_pong.store(false, Ordering::SeqCst);
+                            }
+                            crate::protocol::ClientFrame::ToolResult { response_to_request_id, data, error } => {
+                                let outcome = match error {
+                                    Some(e) => crate::hub::DispatchOutcome::Error(e),
+                                    None => crate::hub::DispatchOutcome::Answer(data.unwrap_or(Value::Null)),
+                                };
+                                hub.resolve(&response_to_request_id, outcome).await;
+                            }
+                        }
+                    } else {
+                        tracing::warn!("invalid frame from extension");
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+
+    teardown.finish().await;
+    tracing::info!("chrome extension disconnected");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn test_outbound() -> Outbound {
+        Arc::new(|_: &ServerFrame| true)
+    }
+
+    /// A connection task that dies by panicking must still let go of the hub;
+    /// otherwise tool calls keep flowing to a socket nobody reads.
+    #[tokio::test]
+    async fn a_panicking_connection_task_still_detaches() {
+        let hub = Hub::new(TOOL_TIMEOUT_MS);
+        let outbound = test_outbound();
+        let task = tokio::spawn({
+            let hub = hub.clone();
+            let outbound = outbound.clone();
+            async move {
+                let _teardown = ConnectionTeardown::new(hub.clone(), outbound.clone());
+                hub.attach(outbound).await;
+                panic!("simulated failure after attach");
+            }
+        });
+        assert!(task.await.unwrap_err().is_panic());
+        // Drop detaches on a spawned task; give it a turn.
+        for _ in 0..50 {
+            if !hub.is_live(&outbound).await {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!hub.is_live(&outbound).await, "hub still dispatches to the dead socket");
+    }
+
+    #[tokio::test]
+    async fn finish_detaches_before_returning() {
+        let hub = Hub::new(TOOL_TIMEOUT_MS);
+        let outbound = test_outbound();
+        let teardown = ConnectionTeardown::new(hub.clone(), outbound.clone());
+        hub.attach(outbound.clone()).await;
+        hub.record_hello("1".into()).await;
+        teardown.finish().await;
+        assert!(!hub.is_live(&outbound).await);
+        assert_eq!(hub.extension_state().await, (false, String::new()));
+    }
+
+    #[tokio::test]
+    async fn status_is_json() {
+        let app = router();
+        let resp = app
+            .oneshot(Request::builder().uri("/chrome/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["name"], "dsh-chrome");
+        assert_eq!(v["running"], true);
+    }
+
+    #[tokio::test]
+    async fn mcp_initialize() {
+        let app = router();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chrome/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["result"]["serverInfo"]["name"], "dsh-chrome");
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_list() {
+        let app = router();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chrome/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 27);
+    }
+
+    #[tokio::test]
+    async fn mcp_parse_error() {
+        let app = router();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chrome/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from("not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+}
